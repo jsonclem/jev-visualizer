@@ -1,22 +1,24 @@
-import type { HistoryEvent, Kind, Status } from "@/lib/tasks";
+import type { Kind, Status, TaskEvent } from "@/lib/tasks";
 
 export const KIND_STYLE: Record<Kind, { label: string; text: string; bg: string }> = {
-  init: { label: "Started", text: "text-info", bg: "bg-info" },
+  record: { label: "Goal recorded", text: "text-info", bg: "bg-info" },
+  start: { label: "Started", text: "text-info", bg: "bg-info" },
   resume: { label: "Resumed", text: "text-info", bg: "bg-info" },
   pass: { label: "Gate passed", text: "text-pass", bg: "bg-pass" },
   block: { label: "Gate blocked", text: "text-block", bg: "bg-block" },
   escalate: { label: "Escalated", text: "text-amend", bg: "bg-amend" },
   commit: { label: "Commit", text: "text-commit", bg: "bg-commit" },
   complete: { label: "Goal complete", text: "text-pass", bg: "bg-pass" },
-  amend: { label: "Goal amended", text: "text-amend", bg: "bg-amend" },
-  reject: { label: "Amend rejected", text: "text-block", bg: "bg-block" },
-  accept: { label: "Change accepted", text: "text-info", bg: "bg-info" },
+  revise: { label: "Goal revised", text: "text-amend", bg: "bg-amend" },
+  reject: { label: "Revision rejected", text: "text-block", bg: "bg-block" },
+  accept: { label: "Config accepted", text: "text-info", bg: "bg-info" },
   close: { label: "Closed", text: "text-muted", bg: "bg-faint" },
   stop: { label: "Stopped", text: "text-block", bg: "bg-block" },
   other: { label: "Event", text: "text-muted", bg: "bg-muted" },
 };
 
 const STATUS_STYLE: Record<Status, { label: string; text: string; dot: string; live?: boolean }> = {
+  ready: { label: "Ready", text: "text-info", dot: "bg-info" },
   active: { label: "In progress", text: "text-amend", dot: "bg-amend", live: true },
   complete: { label: "Complete", text: "text-pass", dot: "bg-pass" },
   closed: { label: "Closed", text: "text-muted", dot: "bg-faint" },
@@ -41,7 +43,7 @@ export function StatusStamp({ status }: { status: Status }) {
 }
 
 // One tick per history event, so a task's shape reads at a glance.
-export function Strip({ history }: { history: HistoryEvent[] }) {
+export function Strip({ history }: { history: TaskEvent[] }) {
   return (
     <div className="flex h-6 flex-wrap items-end gap-[3px]" aria-label={`${history.length} events`}>
       {history.map((event, i) => (

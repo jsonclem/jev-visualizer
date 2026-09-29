@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Goal"
+  short_description: "Write, check and record the goal a task-contract task is held to"
+  default_prompt: "Use $task-goal to turn this request into a checked goal for task-contract."
+
+policy:
+  allow_implicit_invocation: false

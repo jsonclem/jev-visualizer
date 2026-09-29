@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Contract"
+  short_description: "Gate every edit against the recorded goal and check off each objective"
+  default_prompt: "Use $task-contract to execute this task under its recorded goal with scope checks on every edit."
+
+policy:
+  allow_implicit_invocation: false

@@ -22,6 +22,7 @@ export default async function Home() {
         <div className="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2 font-mono text-xs text-muted">
           <span className="truncate">{TASKS_DIR}</span>
           <span>
+            <span className="text-info">{count("ready")}</span> ready ·{" "}
             <span className="text-amend">{count("active")}</span> in progress ·{" "}
             <span className="text-pass">{count("complete")}</span> complete ·{" "}
             <span className="text-paper">{count("closed")}</span> closed
@@ -36,7 +37,9 @@ export default async function Home() {
       ) : (
         <ol className="border-b border-line">
           {tasks.map((task, i) => {
-            const commits = task.history.filter((event) => event.kind === "commit").length;
+            const commits = task.events.filter((event) => event.kind === "commit").length;
+            const objectives = task.goal?.objectives ?? [];
+            const met = objectives.filter((o) => task.objectives[o.id]?.state === "met").length;
             return (
               <li
                 key={task.id}
@@ -57,13 +60,16 @@ export default async function Home() {
                       {task.title}
                     </h2>
                     <p className="mt-2 line-clamp-2 max-w-2xl text-sm leading-relaxed text-muted">
-                      {task.goal[0].text}
+                      {task.goal?.summary || task.goal?.objectives[0]?.text}
                     </p>
                   </div>
                   <div className="flex flex-col justify-end gap-3 md:items-end">
-                    <Strip history={task.history} />
+                    <Strip history={task.events} />
                     <p className="font-mono text-xs text-muted">
-                      {task.history.length} events · {commits} {commits === 1 ? "commit" : "commits"}
+                      <span className={objectives.length && met === objectives.length ? "text-pass" : "text-paper"}>
+                        {met}/{objectives.length}
+                      </span>{" "}
+                      objectives · {commits} {commits === 1 ? "commit" : "commits"}
                     </p>
                     <p className="font-mono text-xs text-faint">
                       last activity {ago(task.lastAt)}

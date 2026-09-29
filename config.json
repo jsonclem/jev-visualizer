@@ -1,0 +1,61 @@
+{
+  "_note": "Tuning for goal.py (task-goal) and check.py (task-contract). Start conservative and tune against real goals and diffs. Thresholds are tuned against `model`; re-tune when it changes. Never carry a threshold across primitives: a Noul value and a Choice confidence are not comparable. Changing this file mid-task stops the task until the user runs check.py --accept-config.",
+
+  "model": "jev-1.13.0",
+
+  "goal_clarity": {
+    "_note": "Whole-goal check at --check, --record and --revise. Scores are out of 3.0.",
+    "min_precision_score": 2.0,
+    "min_boundedness_score": 1.8,
+    "min_confidence": 0.50,
+    "drift_license_block": 0.60
+  },
+
+  "objective_clarity": {
+    "_note": "One Jev request per objective and per rule. Each Noul asks about a defect; at or above its value blocks the goal.",
+    "multiple_conditions_block": 0.60,
+    "not_checkable_block": 0.60,
+    "vague_block": 0.60,
+    "rule_is_objective_block": 0.60
+  },
+
+  "scope": {
+    "_note": "Checked per changed file on every step. outside_scope at or above block_verdict_confidence blocks; any drift Noul at or above drift_block blocks; a verdict below min_verdict_confidence escalates to the user.",
+    "block_verdict_confidence": 0.60,
+    "drift_block": 0.60,
+    "min_verdict_confidence": 0.50
+  },
+
+  "completion": {
+    "_note": "Checked per objective against only its files. An objective is met at or above item_complete.",
+    "item_complete": 0.85
+  },
+
+  "diff": {
+    "_note": "Unchanged lines around each change. Completion first tries whole enclosing functions, then falls back to completion_fallback_lines.",
+    "scope_context_lines": 3,
+    "completion_fallback_lines": 3
+  },
+
+  "verify": {
+    "_note": "Seconds before a Verify command, or its Requires check, counts as couldn't run.",
+    "timeout_seconds": 900,
+    "requires_timeout_seconds": 60
+  },
+
+  "request_budget": {
+    "_note": "Jev allows 32k tokens for state plus the longest question per request. Code tokenizes denser than prose, so estimate low and keep headroom.",
+    "max_tokens": 32000,
+    "headroom": 0.85,
+    "chars_per_token": 3
+  },
+
+  "commits": {
+    "max_subject_chars": 72
+  },
+
+  "handoff": {
+    "_note": "Context usage at which the agent hands off to a new session, used only when reliable usage information is available.",
+    "context_percent": 50
+  }
+}

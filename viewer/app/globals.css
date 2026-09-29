@@ -185,3 +185,12 @@ details[open] > summary .chevron {
     animation: none;
   }
 }
+
+/* Couldn't check / couldn't run: a result that is missing, not a failure. */
+.hatched {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgb(129 144 184 / 0.14) 0 4px,
+    transparent 4px 8px
+  );
+}

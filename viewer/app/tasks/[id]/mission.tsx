@@ -2,9 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import type { HistoryEvent, Kind, Task } from "@/lib/tasks";
+import type { Kind, ObjectiveRecord, Task, TaskEvent, VerifyRecord } from "@/lib/tasks";
 import { clock, KIND_STYLE, StatusStamp } from "../../ui";
-import { Evidence, num, parseCompletion, parseScope } from "./evidence";
+import { Bar, Evidence, hasEvidence, num, OBJECTIVE_MARK, VERIFY_MARK } from "./evidence";
 import type { Mode, Stage } from "./stage";
 
 const POLL_MS = 3000;
@@ -13,19 +13,11 @@ const SKIP_SPEED = 40;
 // check.py stops and hands these back to the user.
 const WAITING: Kind[] = ["block", "escalate", "reject", "stop"];
 
-// After a pass whose completion was too large to check, the agent commits and
-// then must ask the user whether the goal is complete (SKILL.md).
-function waitingOnYou(history: HistoryEvent[]) {
-  const last = history.at(-1);
-  if (!last) return false;
-  if (WAITING.includes(last.kind)) return true;
-  if (last.kind !== "commit") return false;
-  const pass = history.findLast((event) => event.kind === "pass");
-  return !!pass && completionUnchecked(pass);
-}
-
-function completionUnchecked(event: HistoryEvent) {
-  return /(^|\s)complete=unknown(\s|$)/.test(event.detail);
+// check.py's NEXT line says when the agent must stop and ask.
+function waitingOnYou(task: Task) {
+  if (task.next?.startsWith("ask the user")) return true;
+  const last = task.events.at(-1);
+  return !!last && WAITING.includes(last.kind);
 }
 
 type Overlay =
@@ -40,9 +32,9 @@ export function Mission({ initial }: { initial: Task }) {
   const [stage, setStage] = useState<Stage | null>(null);
   const [played, setPlayed] = useState(0);
   const [overlay, setOverlay] = useState<Overlay | null>(null);
-  const [replaying, setReplaying] = useState(initial.history.length > 0);
+  const [replaying, setReplaying] = useState(initial.events.length > 0);
   const [speed, setSpeed] = useState(REPLAY_SPEED);
-  const replayUntil = useRef(initial.history.length);
+  const replayUntil = useRef(initial.events.length);
   const skipping = useRef(false);
 
   // Live updates: re-read the task folder every few seconds.
@@ -81,22 +73,22 @@ export function Mission({ initial }: { initial: Task }) {
     };
   }, []);
 
-  // The director: plays each history event in order, fast for the replay,
-  // then waits for new events from the poll.
+  // The director: plays each event in order, fast for the replay, then waits
+  // for new events from the poll.
   useEffect(() => {
     if (!stage) return;
     let alive = true;
     (async () => {
       let i = 0;
       while (alive) {
-        const history = taskRef.current.history;
-        if (i < history.length) {
+        const events = taskRef.current.events;
+        if (i < events.length) {
           const replay = i < replayUntil.current;
           stage.setSpeed(!replay ? 1 : skipping.current ? SKIP_SPEED : REPLAY_SPEED);
           const show = (next: Overlay | null) => {
             if (alive && !(replay && skipping.current)) setOverlay(next);
           };
-          await direct(stage, history[i], taskRef.current, show);
+          await direct(stage, events, i, taskRef.current, show);
           if (!alive) return;
           i += 1;
           setPlayed(i);
@@ -113,9 +105,9 @@ export function Mission({ initial }: { initial: Task }) {
     };
   }, [stage]);
 
-  const drained = played >= task.history.length;
-  const last = task.history.at(-1);
-  const needsYou = task.status === "active" && waitingOnYou(task.history);
+  const drained = played >= task.events.length;
+  const last = task.events.at(-1);
+  const needsYou = task.status === "active" && waitingOnYou(task);
   const mode: Mode =
     task.status === "complete"
       ? "complete"
@@ -126,8 +118,8 @@ export function Mission({ initial }: { initial: Task }) {
           : "cruise";
 
   useEffect(() => {
-    if (stage && drained) stage.setMode(mode);
-  }, [stage, drained, mode]);
+    if (stage && drained && task.status !== "ready") stage.setMode(mode);
+  }, [stage, drained, mode, task.status]);
 
   // The tab title follows the polled task, not the animation, so it still
   // changes while the tab is in the background and animations are paused.
@@ -143,11 +135,11 @@ export function Mission({ initial }: { initial: Task }) {
     stage?.setSpeed(SKIP_SPEED);
   };
 
-  const shown = task.history.slice(0, played);
+  const shown = task.events.slice(0, played);
 
   return (
-    <div className="grid min-h-screen lg:h-screen lg:grid-cols-[16rem_minmax(0,1fr)_19rem] xl:grid-cols-[20rem_minmax(0,1fr)_24rem] lg:overflow-hidden">
-      <Objectives task={task} shown={shown} />
+    <div className="grid min-h-screen lg:h-screen lg:grid-cols-[18rem_minmax(0,1fr)_19rem] xl:grid-cols-[22rem_minmax(0,1fr)_24rem] lg:overflow-hidden">
+      <Objectives task={task} shown={shown} drained={drained} />
 
       <section className="relative order-first h-[72vh] border-line lg:order-none lg:h-auto lg:border-x">
         <div className="playfield relative mx-auto h-full max-w-[560px] overflow-hidden border-x border-info/15">
@@ -171,17 +163,36 @@ export function Mission({ initial }: { initial: Task }) {
   );
 }
 
-async function direct(stage: Stage, event: HistoryEvent, task: Task, show: (overlay: Overlay | null) => void) {
+// Objectives met at this gate that were not met at the previous one.
+function newlyMet(events: TaskEvent[], i: number) {
+  const now = events[i].objectives ?? {};
+  const before = events.slice(0, i).findLast((event) => event.objectives)?.objectives ?? {};
+  return Object.entries(now)
+    .filter(([id, record]) => record.state === "met" && before[id]?.state !== "met")
+    .map(([id]) => id);
+}
+
+async function direct(
+  stage: Stage,
+  events: TaskEvent[],
+  i: number,
+  task: Task,
+  show: (overlay: Overlay | null) => void,
+) {
   const { COLOR } = await import("./stage");
-  const section = (name: string) => event.sections.find((s) => s.name === name);
-  const correction = section("correction")?.value.trim() ?? "";
+  const event = events[i];
 
   switch (event.kind) {
-    case "init":
-      show({ kind: "briefing", title: "Mission briefing", body: task.goal[0]?.text ?? "" });
-      await stage.launch();
+    case "record": {
+      const goal = task.goal;
+      const lines = goal?.objectives.map((o) => `${o.id}  ${o.title || o.text.split("\n")[0]}`) ?? [];
+      show({ kind: "briefing", title: `Mission briefing · ${goal?.title ?? task.title}`, body: lines.join("\n") });
       await stage.wait(2600);
       show(null);
+      return;
+    }
+    case "start":
+      await stage.launch();
       return;
     case "resume":
       await stage.warpIn("SESSION RESUMED");
@@ -189,70 +200,69 @@ async function direct(stage: Stage, event: HistoryEvent, task: Task, show: (over
     case "pass":
     case "block":
     case "escalate": {
-      const scope = section("scope");
-      if (scope) {
-        const { files, drifts } = parseScope(scope);
-        const blockAt = num(task.config, "scope.block_verdict_confidence") ?? 0.6;
-        const sureAt = num(task.config, "scope.min_verdict_confidence") ?? 0.5;
-        const driftAt = num(task.config, "scope.drift_block") ?? 0.6;
-        if (files.length) {
-          await stage.cargo(
-            files.map((file) => {
-              const outside = file.verdict !== "within_scope";
-              const refused = outside && file.confidence >= blockAt;
-              const unsure = outside || file.confidence < sureAt;
-              return {
-                accepted: !refused,
-                color: refused ? COLOR.block : unsure ? COLOR.amend : COLOR.pass,
-              };
-            }),
-          );
-        }
-        if (drifts.length) {
-          await stage.driftWave(
-            drifts.map((drift) => ({
-              label: DRIFT_LABEL[drift.name] ?? drift.name.replace(/^drift_/, ""),
-              value: drift.value,
-              tripped: drift.value >= driftAt,
-            })),
-          );
-        }
+      const blockAt = num(task.config, "scope.block_verdict_confidence") ?? 0.6;
+      const sureAt = num(task.config, "scope.min_verdict_confidence") ?? 0.5;
+      const driftAt = num(task.config, "scope.drift_block") ?? 0.6;
+      if (event.scope?.length) {
+        await stage.cargo(
+          event.scope.map((file) => {
+            const outside = file.verdict !== "within_scope";
+            const refused = outside && file.confidence >= blockAt;
+            const unsure = outside || file.confidence < sureAt;
+            return { accepted: !refused, color: refused ? COLOR.block : unsure ? COLOR.amend : COLOR.pass };
+          }),
+        );
+      }
+      if (event.drift) {
+        await stage.driftWave(
+          Object.entries(event.drift).map(([name, value]) => ({
+            label: DRIFT_LABEL[name] ?? name.replace(/^drift_/, ""),
+            value,
+            tripped: value >= driftAt,
+          })),
+        );
       }
       if (event.kind === "pass") {
         await stage.warpRing();
-        if (completionUnchecked(event)) await stage.ping("COMPLETION NOT CHECKED", COLOR.amend);
-      }
-      else if (event.kind === "block") await stage.forceField(blockReason(event.detail));
-      else await stage.ping(escalateReason(event.detail), COLOR.amend);
+        const met = newlyMet(events, i);
+        if (met.length) {
+          await stage.cargo(met.map(() => ({ accepted: true, color: COLOR.pass })));
+          await stage.ping(`${met.join(" ")} MET`, COLOR.pass);
+        }
+        const unchecked = Object.entries(event.objectives ?? {}).filter(([, r]) => r.state === "unchecked");
+        if (unchecked.length) await stage.ping(`${unchecked.map(([id]) => id).join(" ")} NOT CHECKABLE`, COLOR.amend);
+        const verify = Object.entries(event.verify ?? {});
+        const failed = verify.filter(([, r]) => r.state === "failed").map(([id]) => id);
+        const stuck = verify.filter(([, r]) => r.state === "couldnt_run").map(([id]) => id);
+        if (failed.length) await stage.ping(`${failed.join(" ")} FAILED`, COLOR.block);
+        if (stuck.length) await stage.ping(`${stuck.join(" ")} COULDN'T RUN`, COLOR.amend);
+      } else if (event.kind === "block") await stage.forceField(blockReason(event));
+      else await stage.ping(escalateReason(event), COLOR.amend);
       return;
     }
-    case "commit": {
-      const [sha, ...subject] = event.detail.split("  ");
-      await stage.station(sha, subject.join("  ").replace(/ session=\S+$/, ""));
+    case "commit":
+      await stage.station(event.sha ?? "", event.subject ?? "");
       return;
-    }
     case "complete":
       await stage.planet();
       show({ kind: "banner", title: "Mission complete", tone: "pass" });
       await stage.wait(2800);
       show(null);
       return;
-    case "amend":
-      show({ kind: "comms", title: "Incoming transmission · Command", body: correction });
-      await stage.wait(Math.min(9000, Math.max(3000, 1500 + correction.length * 28)));
-      show(null);
-      return;
-    case "reject": {
-      const notes = (section("clarity")?.items ?? [])
-        .filter((item) => item.startsWith("- "))
-        .map((item) => item.slice(2));
-      show({ kind: "static", title: "Transmission rejected", body: [correction, ...notes].join("\n\n") });
-      await stage.wait(3600);
+    case "revise": {
+      const body = (event.changes ?? []).join("\n");
+      show({ kind: "comms", title: `Goal revised · version ${event.version}`, body });
+      await stage.wait(Math.min(6000, 2000 + body.length * 28));
       show(null);
       return;
     }
+    case "reject":
+      show({ kind: "static", title: "Revision rejected", body: (event.changes ?? []).join("\n") });
+      await stage.wait(3600);
+      show(null);
+      return;
     case "accept":
-      show({ kind: "comms", title: "Command acknowledged", body: event.detail.replace(/ session=\S+$/, "") });
+      show({ kind: "comms", title: "Config accepted", body: (event.changes ?? []).join("\n") });
       await stage.wait(2400);
       show(null);
       return;
@@ -278,21 +288,18 @@ const DRIFT_LABEL: Record<string, string> = {
   drift_substitute: "subst",
 };
 
-function blockReason(detail: string) {
-  const drift = /drift=(\S+)/.exec(detail);
-  const outside = /outside_scope=(\S+)/.exec(detail);
-  if (outside) return `OUTSIDE SCOPE · ${outside[1].split(",").map(basename).join(", ")}`;
-  if (drift) return `DRIFT · ${drift[1].replace(/drift_/g, "").replace(/,/g, ", ").toUpperCase()}`;
+function blockReason(event: TaskEvent) {
+  if (event.uncovered?.length) return `NOT IN ANY FILES LINE · ${event.uncovered.map(basename).join(", ")}`;
+  if (event.blocked?.length) return `OUTSIDE SCOPE · ${event.blocked.map(basename).join(", ")}`;
+  const tripped = Object.keys(event.tripped ?? {});
+  if (tripped.length) return `DRIFT · ${tripped.map((k) => k.replace(/^drift_/, "")).join(", ").toUpperCase()}`;
   return "BLOCKED";
 }
 
-function escalateReason(detail: string) {
-  const files = /files=(\S+)/.exec(detail);
-  const tooLarge = /too-large file=(\S+)/.exec(detail);
-  if (files) return `LOW CONFIDENCE · ${files[1].split(",").map(basename).join(", ")}`;
-  if (tooLarge) return `TOO LARGE TO CHECK · ${basename(tooLarge[1])}`;
-  if (detail.startsWith("diff-failed")) return "COULD NOT DIFF CHANGES";
-  if (detail.startsWith("no-changes")) return "NO CHANGES TO CHECK";
+function escalateReason(event: TaskEvent) {
+  if (event.unsure?.length) return `LOW CONFIDENCE · ${event.unsure.map(basename).join(", ")}`;
+  if (event.verify_changed?.length) return `VERIFY CHANGED FILES · ${event.verify_changed.map(basename).join(", ")}`;
+  if (event.reason === "no-changes") return "NO CHANGES TO CHECK";
   return "ESCALATED";
 }
 
@@ -324,6 +331,7 @@ function Hud({
     tick();
     return () => clearInterval(timer);
   }, []);
+  const next = mode && (task.status === "active" || task.status === "ready") ? task.next : null;
 
   return (
     <div className="pointer-events-none absolute inset-0 font-mono text-[10px] tracking-[0.2em] uppercase">
@@ -334,7 +342,7 @@ function Hud({
         <span className="flex shrink-0 flex-col items-end gap-1.5">
           <span>
             event <span className="text-paper">{String(played).padStart(2, "0")}</span>/
-            {String(task.history.length).padStart(2, "0")}
+            {String(task.events.length).padStart(2, "0")}
           </span>
           {replaying && (
             <button
@@ -347,13 +355,26 @@ function Hud({
           )}
         </span>
       </div>
-      <div className="absolute inset-x-3 bottom-3 text-center">
+      <div className="absolute inset-x-3 bottom-3 grid justify-items-center gap-2 text-center">
+        {next && (
+          <p
+            className={`max-w-full rounded border bg-ink/80 px-3 py-1.5 tracking-[0.12em] normal-case ${
+              mode === "hold" ? "border-amend/60 text-amend" : "border-info/40 text-info"
+            }`}
+          >
+            <span className="mr-2 tracking-[0.2em] uppercase opacity-70">next</span>
+            {next}
+          </p>
+        )}
         {mode === "hold" && (
           <span className="blink inline-block rounded border border-amend/60 bg-ink/70 px-3 py-1.5 text-amend">
             ⚠ awaiting command · needs you
           </span>
         )}
-        {mode === "cruise" && (
+        {mode === "cruise" && task.status === "ready" && (
+          <span className="text-info">goal recorded · waiting for check.py --start</span>
+        )}
+        {mode === "cruise" && task.status !== "ready" && (
           <span className="text-muted">
             last transmission{" "}
             <span className="text-paper">{now && lastAt ? since(now, lastAt) : "--"}</span> ago
@@ -440,17 +461,23 @@ function Typewriter({ text, cps }: { text: string; cps: number }) {
   );
 }
 
-function Objectives({ task, shown }: { task: Task; shown: HistoryEvent[] }) {
+// During the replay the panel follows the events shown so far; once caught up
+// it shows state.json, which also reflects goal revisions.
+function records(task: Task, shown: TaskEvent[], drained: boolean) {
+  if (drained) return { objectives: task.objectives, verify: task.verify };
+  const gate = shown.findLast((event) => event.objectives);
+  return { objectives: gate?.objectives ?? {}, verify: gate?.verify ?? {} };
+}
+
+function Objectives({ task, shown, drained }: { task: Task; shown: TaskEvent[]; drained: boolean }) {
   const threshold = num(task.config, "completion.item_complete") ?? 0.85;
-  const latest = [...shown].reverse().find((event) => {
-    const section = event.sections.find((s) => s.name === "completion");
-    return section && parseCompletion(section).length > 0;
-  });
-  const scores = latest ? parseCompletion(latest.sections.find((s) => s.name === "completion")!) : [];
-  const latestPass = shown.findLast((event) => event.kind === "pass");
-  const unchecked = !!latestPass && latestPass !== latest && completionUnchecked(latestPass);
-  const done = task.objectives.filter((_, i) => (scores[i]?.value ?? 0) >= threshold).length;
-  const [original, ...corrections] = task.goal;
+  const goal = task.goal;
+  const current = records(task, shown, drained);
+  const objectives = goal?.objectives ?? [];
+  const checks = goal?.verify ?? [];
+  const met = objectives.filter((o) => current.objectives[o.id]?.state === "met").length;
+  const passed = checks.filter((c) => current.verify[c.id]?.state === "passed").length;
+  const versions = task.events.filter((event) => event.kind === "record" || event.kind === "revise");
 
   return (
     <aside className="flex min-h-0 flex-col border-t border-line bg-panel/35 lg:border-t-0">
@@ -464,83 +491,225 @@ function Objectives({ task, shown }: { task: Task; shown: HistoryEvent[] }) {
         <div className="mt-4 flex flex-wrap items-center gap-2 font-mono text-xs text-muted">
           <StatusStamp status={task.status} />
           <span title={task.repoPath}>{task.repo}</span>
+          {goal && <span>v{goal.version}</span>}
         </div>
         <h1 className="glow mt-3 font-display text-2xl leading-tight font-semibold tracking-wide">{task.title}</h1>
+        {goal?.summary && <p className="mt-2 text-[13px] leading-snug text-muted">{goal.summary}</p>}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
-        <p className="flex items-baseline justify-between font-display text-[11px] font-semibold tracking-[0.25em] text-info uppercase">
-          <span className="glow">▸ Objectives</span>
-          <span>
-            <span className={done === task.objectives.length ? "text-pass" : "text-paper"}>{done}</span>/
-            {task.objectives.length}
-          </span>
-        </p>
-        {unchecked ? (
-          <p className="mt-2 text-xs text-amend">
-            Not checked on the latest pass: the change was too large to score.
-            {latest && ` Scores below are from ${clock(latest.at)}.`}
-          </p>
-        ) : (
-          !latest && <p className="mt-2 text-xs text-muted">Scores arrive with the first passed gate.</p>
-        )}
-        <ol className="mt-4 space-y-3.5">
-          {task.objectives.map((objective, i) => {
-            const value = scores[i]?.value;
-            const complete = value !== undefined && value >= threshold;
-            return (
-              <li key={i} className="grid grid-cols-[1rem_1fr] gap-2">
-                <span className={`font-mono text-xs ${complete ? "text-pass" : "text-faint"}`}>
-                  {complete ? "✓" : "◇"}
-                </span>
-                <div className="min-w-0">
-                  <p className={`line-clamp-2 text-[13px] leading-snug ${complete ? "text-paper" : "text-muted"}`}>
-                    {objective}
-                  </p>
-                  <div className="mt-1.5 flex items-center gap-2">
-                    <div className="relative h-1.5 flex-1">
-                      <div className="segments absolute inset-0 bg-line">
-                        <div
-                          className={`absolute inset-y-0 left-0 transition-[width] duration-700 ${complete ? "bg-pass" : "bg-amend"}`}
-                          style={{ width: `${(value ?? 0) * 100}%` }}
-                        />
-                      </div>
-                      <div
-                        className="absolute -inset-y-0.5 w-px bg-paper/50"
-                        style={{ left: `${threshold * 100}%` }}
-                      />
-                    </div>
-                    <span className="w-8 text-right font-mono text-[10px] text-faint">
-                      {value === undefined ? "--" : value.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              </li>
-            );
-          })}
+        <PanelHeading label="Objectives" done={met} total={objectives.length} />
+        <ol className="mt-4 space-y-4">
+          {objectives.map((objective) => (
+            <ObjectiveRow
+              key={objective.id}
+              id={objective.id}
+              title={objective.title}
+              text={objective.text}
+              files={objective.files}
+              record={current.objectives[objective.id] ?? { state: "pending" }}
+              threshold={threshold}
+            />
+          ))}
         </ol>
 
-        <details className="mt-8 border-t border-line pt-4">
+        <div className="mt-8">
+          <PanelHeading label="Verify" done={passed} total={checks.length} />
+          <ol className="mt-4 space-y-3.5">
+            {checks.map((check) => (
+              <VerifyRow
+                key={check.id}
+                id={check.id}
+                command={check.command}
+                requires={check.requires}
+                record={current.verify[check.id] ?? { state: "pending" }}
+                log={drained ? task.logs[check.id] : undefined}
+              />
+            ))}
+          </ol>
+        </div>
+
+        {goal && (goal.rules.length > 0 || goal.out_of_scope.length > 0) && (
+          <details className="mt-8 border-t border-line pt-4">
+            <summary className="font-mono text-[10px] tracking-[0.2em] text-faint uppercase hover:text-paper">
+              <span className="chevron mr-2 inline-block transition-transform">›</span>
+              Rules · out of scope
+            </summary>
+            <ul className="mt-3 space-y-2 text-[13px] leading-snug">
+              {goal.rules.map((rule) => (
+                <li key={rule.id} className="grid grid-cols-[2rem_1fr] gap-1">
+                  <span className="font-mono text-xs text-info">{rule.id}</span>
+                  <span className="text-paper/90">{rule.text}</span>
+                </li>
+              ))}
+              {goal.out_of_scope.map((item) => (
+                <li key={item.id} className="grid grid-cols-[2rem_1fr] gap-1">
+                  <span className="font-mono text-xs text-block/80">{item.id}</span>
+                  <span className="text-muted">{item.text}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+
+        {versions.length > 0 && (
+          <details className="mt-4 border-t border-line pt-4">
+            <summary className="font-mono text-[10px] tracking-[0.2em] text-faint uppercase hover:text-paper">
+              <span className="chevron mr-2 inline-block transition-transform">›</span>
+              Goal versions · {versions.length}
+            </summary>
+            <ol className="mt-3 space-y-2 font-mono text-xs">
+              {versions.map((event) => (
+                <li key={event.at + event.version}>
+                  <span className="text-paper">v{event.version}</span>{" "}
+                  <span className="text-faint">{clock(event.at)}</span>
+                  <p className="text-muted">{event.kind === "record" ? "recorded" : (event.changes ?? []).join(", ")}</p>
+                </li>
+              ))}
+            </ol>
+          </details>
+        )}
+
+        <details className="mt-4 border-t border-line pt-4">
           <summary className="font-mono text-[10px] tracking-[0.2em] text-faint uppercase hover:text-paper">
             <span className="chevron mr-2 inline-block transition-transform">›</span>
-            Full briefing
+            Full goal
           </summary>
-          <p className="mt-3 text-[13px] leading-relaxed whitespace-pre-wrap text-paper/90">{original?.text}</p>
-          {corrections.map((correction, i) => (
-            <div key={i} className="mt-4 border-l-2 border-amend pl-3">
-              <p className="font-mono text-[10px] tracking-[0.2em] text-amend uppercase">
-                Correction {correction.at && `· ${clock(correction.at)}`}
-              </p>
-              <p className="mt-1 text-[13px] leading-relaxed whitespace-pre-wrap">{correction.text}</p>
-            </div>
-          ))}
+          <pre className="mt-3 font-sans text-[13px] leading-relaxed whitespace-pre-wrap text-paper/90">
+            {task.goalText}
+          </pre>
         </details>
       </div>
     </aside>
   );
 }
 
-function FlightLog({ shown, config }: { shown: HistoryEvent[]; config: Task["config"] }) {
+function PanelHeading({ label, done, total }: { label: string; done: number; total: number }) {
+  return (
+    <p className="flex items-baseline justify-between font-display text-[11px] font-semibold tracking-[0.25em] text-info uppercase">
+      <span className="glow">▸ {label}</span>
+      <span>
+        <span className={total && done === total ? "text-pass" : "text-paper"}>{done}</span>/{total}
+      </span>
+    </p>
+  );
+}
+
+function ObjectiveRow({
+  id,
+  title,
+  text,
+  files,
+  record,
+  threshold,
+}: {
+  id: string;
+  title: string;
+  text: string;
+  files: string[];
+  record: ObjectiveRecord;
+  threshold: number;
+}) {
+  const mark = OBJECTIVE_MARK[record.state];
+  const unchecked = record.state === "unchecked";
+  return (
+    <li className="grid grid-cols-[1rem_1fr] gap-2">
+      <span className={`font-mono text-xs ${mark.text}`} title={mark.label}>
+        {mark.mark}
+      </span>
+      <div className="min-w-0">
+        <p className="flex items-baseline gap-2">
+          <span className={`font-mono text-xs ${mark.text}`}>{id}</span>
+          {title && <span className="truncate text-[13px] font-medium text-paper">{title}</span>}
+        </p>
+        <p
+          className={`mt-0.5 line-clamp-3 text-[13px] leading-snug ${record.state === "met" ? "text-paper/90" : "text-muted"}`}
+          title={text}
+        >
+          {text}
+        </p>
+        <p className="mt-1 truncate font-mono text-[10px] text-faint" title={files.join(", ")}>
+          {files.join(", ")}
+        </p>
+        {record.score !== undefined ? (
+          <div className="mt-1.5 flex items-center gap-2">
+            <div className="flex-1">
+              <Bar value={record.score} threshold={threshold} tone={record.state === "met" ? "bg-pass" : "bg-amend"} />
+            </div>
+            <span className={`w-8 text-right font-mono text-[10px] ${mark.text}`}>{record.score.toFixed(2)}</span>
+          </div>
+        ) : (
+          <p
+            className={`mt-1.5 px-2 py-1 font-mono text-[10px] ${
+              unchecked ? "hatched border border-muted/40 text-muted" : "text-faint"
+            }`}
+          >
+            {mark.label}
+            {record.reason ? ` · ${record.reason}` : ""}
+          </p>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function VerifyRow({
+  id,
+  command,
+  requires,
+  record,
+  log,
+}: {
+  id: string;
+  command: string;
+  requires: string;
+  record: VerifyRecord;
+  log?: string;
+}) {
+  const mark = VERIFY_MARK[record.state];
+  return (
+    <li className="grid grid-cols-[1rem_1fr] gap-2">
+      <span className={`font-mono text-xs ${mark.text}`} title={mark.label}>
+        {mark.mark}
+      </span>
+      <div className="min-w-0">
+        <p className="flex items-baseline gap-2">
+          <span className={`font-mono text-xs ${mark.text}`}>{id}</span>
+          <code className="truncate font-mono text-[11px] text-paper" title={command}>
+            {command}
+          </code>
+        </p>
+        {requires && (
+          <p className="truncate font-mono text-[10px] text-faint" title={requires}>
+            requires {requires}
+          </p>
+        )}
+        <p
+          className={`mt-1 px-2 py-1 font-mono text-[10px] ${
+            record.state === "couldnt_run" ? "hatched border border-muted/40" : ""
+          } ${mark.text}`}
+        >
+          {mark.label}
+          {record.state === "passed" && record.seconds !== undefined ? ` · ${record.seconds}s` : ""}
+          {record.reason && record.state !== "passed" ? ` · ${record.reason}` : ""}
+        </p>
+        {log && (
+          <details className="mt-1">
+            <summary className="font-mono text-[10px] tracking-[0.2em] text-faint uppercase hover:text-paper">
+              <span className="chevron mr-1.5 inline-block transition-transform">›</span>
+              log
+            </summary>
+            <pre className="mt-1 max-h-64 overflow-auto rounded-sm border border-line bg-ink/70 p-2 font-mono text-[10px] leading-snug whitespace-pre-wrap text-muted">
+              {log}
+            </pre>
+          </details>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function FlightLog({ shown, config }: { shown: TaskEvent[]; config: Task["config"] }) {
   const listRef = useRef<HTMLOListElement>(null);
   useEffect(() => {
     const list = listRef.current;
@@ -568,13 +737,13 @@ function FlightLog({ shown, config }: { shown: HistoryEvent[]; config: Task["con
                 </span>
               </div>
               <Detail event={event} />
-              {event.sections.length > 0 && (
+              {hasEvidence(event) && (
                 <details className="mt-1.5">
                   <summary className="font-mono text-[10px] tracking-[0.2em] text-faint uppercase hover:text-paper">
                     <span className="chevron mr-1.5 inline-block transition-transform">›</span>
                     evidence
                   </summary>
-                  <Evidence sections={event.sections} config={config} />
+                  <Evidence event={event} config={config} />
                 </details>
               )}
             </li>
@@ -585,40 +754,50 @@ function FlightLog({ shown, config }: { shown: HistoryEvent[]; config: Task["con
   );
 }
 
-function Detail({ event }: { event: HistoryEvent }) {
+function Detail({ event }: { event: TaskEvent }) {
   if (event.kind === "commit") {
-    const [sha, ...subject] = event.detail.split("  ");
     return (
       <p className="mt-0.5">
-        <code className="font-mono text-[11px] text-faint">{sha}</code>{" "}
-        <span className="font-display text-[15px] leading-tight">{subject.join("  ")}</span>
+        <code className="font-mono text-[11px] text-faint">{event.sha}</code>{" "}
+        <span className="font-display text-[15px] leading-tight">{event.subject}</span>
       </p>
     );
   }
-  const pairs = event.detail
-    .split(/\s+/)
-    .flatMap((token) => {
-      const match = /^(\w+)=(.+)$/.exec(token);
-      return match ? [[match[1], match[2]] as const] : [];
-    });
-  const words = event.detail
-    .split(/\s+/)
-    .filter((token) => token && !/^\w+=/.test(token))
-    .join(" ");
+  const chips: [string, string, boolean?][] = [];
+  if (event.version) chips.push(["version", String(event.version)]);
+  if (event.base) chips.push(["base", event.base]);
+  if (event.objectives) {
+    const all = Object.values(event.objectives);
+    chips.push(["met", `${all.filter((r) => r.state === "met").length}/${all.length}`]);
+  }
+  if (event.uncovered?.length) chips.push(["not in files", event.uncovered.join(", "), true]);
+  if (event.blocked?.length) chips.push(["outside scope", event.blocked.join(", "), true]);
+  if (event.tripped && Object.keys(event.tripped).length) chips.push(["drift", Object.keys(event.tripped).join(", "), true]);
+  if (event.unsure?.length) chips.push(["unsure", event.unsure.join(", "), true]);
+  if (event.verify_changed?.length) chips.push(["verify changed", event.verify_changed.join(", "), true]);
+  if (event.reason) chips.push(["reason", event.reason]);
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted">
-      {words && <span>{words}</span>}
-      {pairs.map(([key, value]) => (
-        <span
-          key={key}
-          className="inline-flex max-w-full items-baseline gap-1 rounded border border-line px-1.5 py-px font-mono text-[10px]"
-        >
-          <span className="text-faint">{key}</span>
-          <span className={`break-all ${key === "drift" || key === "outside_scope" ? "text-block" : "text-paper"}`}>
-            {value.split(",").join(", ")}
-          </span>
-        </span>
-      ))}
+    <div className="mt-1 grid gap-1.5 text-xs text-muted">
+      {event.detail && <span>{event.detail}</span>}
+      {chips.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {chips.map(([key, value, bad]) => (
+            <span
+              key={key}
+              className="inline-flex max-w-full items-baseline gap-1 rounded border border-line px-1.5 py-px font-mono text-[10px]"
+            >
+              <span className="text-faint">{key}</span>
+              <span className={`break-all ${bad ? "text-block" : "text-paper"}`}>{value}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {event.next && (
+        <p className="font-mono text-[11px]">
+          <span className="text-faint">next </span>
+          <span className={event.next.startsWith("ask the user") ? "text-amend" : "text-info"}>{event.next}</span>
+        </p>
+      )}
     </div>
   );
 }

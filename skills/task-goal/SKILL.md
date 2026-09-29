@@ -5,7 +5,7 @@ description: Write, check and record the goal for a task-contract task. Turns a 
 
 # Task Goal
 
-`GOAL` is `python3 /Users/jasonclements/Desktop/task-contract/skills/task-goal/scripts/goal.py`.
+`GOAL` is `node /Users/jasonclements/Desktop/task-contract/scripts/goal.ts`.
 
 A goal is what a task-contract task is held to. `GOAL` checks its structure in
 plain code and its wording with TypeSafe's Jev API (api.typesafe.ai), then
@@ -74,4 +74,4 @@ file to `GOAL --revise`.
 
 ## After recording
 
-Start the task with task-contract (`check.py --start`).
+Start the task with task-contract (`check.ts --start`).

@@ -5,7 +5,7 @@ description: Run a coding task under a recorded goal. Every change is checked ag
 
 # Task Contract
 
-`CHECK` is `python3 /Users/jasonclements/Desktop/task-contract/skills/task-contract/scripts/check.py`.
+`CHECK` is `node /Users/jasonclements/Desktop/task-contract/scripts/check.ts`.
 
 `CHECK` decides whether work is in scope, which objectives are met, and what
 happens next. You execute its decisions. Act on its exit code and its `NEXT:`
@@ -59,7 +59,7 @@ the committed work.
   commit not made through `CHECK --commit`.
 - goal.md is the user's approved goal. Never edit it; it is read-only on
   purpose. When the user corrects or adds to the goal, change it with
-  task-goal (`goal.py --revise`), never by hand.
+  task-goal (`goal.ts --revise`), never by hand.
 - If goal.md was edited outside the scripts, `CHECK` stops with exit 3.
 - config.json (at /Users/jasonclements/Desktop/task-contract) holds every
   threshold and the handoff point. Only the user changes it. Never edit it. If

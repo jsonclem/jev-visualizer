@@ -1,0 +1,8 @@
+# Task data: client diffs, goals, and the Jev API key. Never pushed.
+/history/
+
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.DS_Store

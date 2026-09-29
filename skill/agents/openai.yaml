@@ -1,0 +1,7 @@
+interface:
+  display_name: "Task Contract"
+  short_description: "Gate every edit against the user's recorded instructions"
+  default_prompt: "Use $task-contract to execute this request under a recorded goal with scope checks on every edit."
+
+policy:
+  allow_implicit_invocation: false

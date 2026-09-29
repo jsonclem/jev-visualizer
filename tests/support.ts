@@ -88,7 +88,25 @@ export class TaskEnv {
   }
 
   git(...args: string[]) {
-    return execFileSync("git", ["-C", this.repo, ...args], { encoding: "utf8" });
+    return this.gitIn(this.repo, ...args);
+  }
+
+  gitIn(repo: string, ...args: string[]) {
+    return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  }
+
+  // Another committed repository beside `demo`, for multi-repository tasks.
+  makeRepo(name: string, files: Record<string, string>) {
+    const repo = path.join(this.tmp, name);
+    mkdirSync(repo);
+    this.gitIn(repo, "init", "-q", "-b", "main");
+    this.gitIn(repo, "config", "user.name", "Test");
+    this.gitIn(repo, "config", "user.email", "test@example.com");
+    this.gitIn(repo, "config", "commit.gpgsign", "false");
+    for (const [file, text] of Object.entries(files)) writeFileSync(path.join(repo, file), text);
+    this.gitIn(repo, "add", "-A");
+    this.gitIn(repo, "commit", "-q", "-m", "Initial");
+    return repo;
   }
 
   write(name: string, text: string) {
@@ -98,12 +116,12 @@ export class TaskEnv {
   }
 
   // [exit code, output] from a CLI's main(), run in the test repository.
-  async run(main: (argv: string[]) => Promise<number>, argv: string[], stdin = ""): Promise<[number, string]> {
+  async run(main: (argv: string[]) => Promise<number>, argv: string[], stdin = "", cwd = this.repo): Promise<[number, string]> {
     const chunks: string[] = [];
     const saved = { write: io.write, stdin: io.stdin, cwd: process.cwd() };
     io.write = (text) => void chunks.push(text);
     io.stdin = () => stdin;
-    process.chdir(this.repo);
+    process.chdir(cwd);
     let code: number;
     try {
       code = await main(argv);
@@ -119,12 +137,16 @@ export class TaskEnv {
     return [code, chunks.join("")];
   }
 
-  goal(argv: string[], stdin = "") {
-    return this.run(goalMain, argv, stdin);
+  goal(argv: string[], stdin = "", cwd = this.repo) {
+    return this.run(goalMain, argv, stdin, cwd);
   }
 
   check(...argv: string[]) {
     return this.run(checkMain, argv);
+  }
+
+  checkIn(cwd: string, ...argv: string[]) {
+    return this.run(checkMain, argv, "", cwd);
   }
 
   task() {

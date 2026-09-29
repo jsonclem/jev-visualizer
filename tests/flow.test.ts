@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { EXIT_BLOCK, EXIT_ESCALATE, EXIT_PASS, EXIT_PRECONDITION } from "../lib/core/common.ts";
 import * as gate from "../lib/core/gate.ts";
 import * as goalfmt from "../lib/core/goalfmt.ts";
 import * as jev from "../lib/core/jev.ts";
+import { fromPaths } from "../lib/core/repos.ts";
 import * as tasks from "../lib/core/tasks.ts";
 import { GOAL, TaskEnv } from "./support.ts";
 
@@ -238,7 +239,8 @@ describe("check.ts", () => {
     env.git("add", "-A");
     const staged = env.git("write-tree").trim();
     jev.hooks.requestTokens = () => 10 ** 6;
-    const records = await gate.completion(env.repo, goal, env.git("rev-parse", "HEAD").trim(), staged, {});
+    const records = await gate.completion(fromPaths({ demo: env.repo }), goal,
+      { demo: env.git("rev-parse", "HEAD").trim() }, { demo: staged }, {});
     assert.notEqual(tree, staged);
     assert.equal(records.O1.state, "unchecked");
     assert.ok(String(records.O1.reason).startsWith("too large: about 1000000 tokens"));
@@ -250,5 +252,127 @@ describe("check.ts", () => {
     const [code, output] = await env.check("--close");
     assert.equal(code, EXIT_PASS, output);
     assert.equal(tasks.readMeta(env.task())!.status, "closed");
+  });
+});
+
+describe("several repositories", () => {
+  let api: string;
+  const goalFor = (apiPath: string) => `# Two repos
+Repo: demo
+Repo: ${apiPath}
+
+## Objectives
+
+### O1
+Files: demo/a.txt
+a.txt says DONE.
+
+### O2
+Files: api/server.txt
+server.txt says DONE.
+
+## Rules
+- R1: Keep each file to one line.
+
+## Verify
+- V1: grep -q DONE a.txt
+  In: demo
+- V2: grep -q DONE server.txt
+  In: api
+`;
+
+  beforeEach(() => {
+    api = env.makeRepo("api", { "server.txt": "server\n" });
+  });
+
+  test("record names every repository", async () => {
+    const [code, output] = await env.goal(["--record", "--slug", "both"], goalFor(api));
+    assert.equal(code, EXIT_PASS, output);
+    const task = env.task();
+    assert.equal(path.basename(task).endsWith("-demo+api-both"), true, task);
+    assert.deepEqual(tasks.readMeta(task)!.repos, { demo: realpathSync(env.repo), api: realpathSync(api) });
+  });
+
+  test("a bare name that is not this repository is rejected", async () => {
+    const [code, output] = await env.goal(["--check"], goalFor(api).replace(`Repo: ${api}`, "Repo: api"));
+    assert.equal(code, EXIT_PRECONDITION);
+    assert.ok(output.includes("Repo: api has no path, and this repository is 'demo'"), output);
+  });
+
+  test("a repository in another open task is rejected", async () => {
+    const single = GOAL.replace("Repo: demo", "Repo: api").replace("Files: a.txt", "Files: server.txt")
+      .replace("Files: b.txt, docs/", "Files: server.txt");
+    let [code, output] = await env.goal(["--record", "--slug", "api-only"], single, api);
+    assert.equal(code, EXIT_PASS, output);
+    [code, output] = await env.goal(["--record", "--slug", "both"], goalFor(api));
+    assert.equal(code, EXIT_PRECONDITION);
+    assert.ok(output.includes("a repository in this goal already has an open task"), output);
+  });
+
+  test("start needs every repository clean and hooks each", async () => {
+    await env.goal(["--record", "--slug", "both"], goalFor(api));
+    writeFileSync(path.join(api, "server.txt"), "dirty\n");
+    let [code, output] = await env.check("--start");
+    assert.equal(code, EXIT_PRECONDITION);
+    assert.ok(output.includes("working tree is not clean in api"), output);
+    env.gitIn(api, "checkout", "--", "server.txt");
+    [code, output] = await env.check("--start");
+    assert.equal(code, EXIT_PASS, output);
+    for (const repo of [env.repo, api]) {
+      assert.ok(readFileSync(path.join(repo, ".git", "hooks", "pre-commit"), "utf8").includes("check.ts"));
+    }
+  });
+
+  test("one task gates, commits and completes across both", async () => {
+    await env.goal(["--record", "--slug", "both"], goalFor(api));
+    await env.check("--start");
+    const asked: Record<string, unknown>[] = [];
+    const real = jev.hooks.post;
+    jev.hooks.post = (state, questions) => {
+      asked.push(state as Record<string, unknown>);
+      return real(state, questions);
+    };
+
+    env.write("a.txt", "DONE\n");
+    writeFileSync(path.join(api, "server.txt"), "not yet\n");
+    let [code, output] = await env.check();
+    assert.equal(code, EXIT_PASS, output);
+    assert.ok(output.includes("demo/a.txt  within_scope"), output);
+    assert.ok(output.includes("api/server.txt  within_scope"), output);
+    assert.ok(output.includes("✓ O1") && output.includes("✗ O2"), output);
+    const scoped = asked.find((s) => s.file === "api/server.txt")!;
+    assert.ok(String(scoped.diff).includes("a/api/server.txt"), String(scoped.diff));
+
+    [code, output] = await env.check("--commit", "-m", "Start both");
+    assert.equal(code, EXIT_PASS, output);
+    for (const repo of [env.repo, api]) assert.equal(env.gitIn(repo, "log", "-1", "--format=%s").trim(), "Start both");
+
+    writeFileSync(path.join(api, "server.txt"), "DONE\n");
+    [code, output] = await env.checkIn(api);
+    assert.equal(code, EXIT_PASS, output);
+    assert.ok(output.includes("✓ V1") && output.includes("✓ V2"), output);
+    assert.ok(output.includes("NEXT: commit; this closes the task"), output);
+    [code, output] = await env.checkIn(api, "--commit", "-m", "Finish api");
+    assert.ok(output.includes("GOAL COMPLETE. The task is closed."), output);
+    assert.equal(env.gitIn(env.repo, "log", "-1", "--format=%s").trim(), "Start both");
+    assert.equal(env.gitIn(api, "log", "-1", "--format=%s").trim(), "Finish api");
+    assert.equal(tasks.readMeta(env.task())!.status, "complete");
+  });
+
+  test("an unlisted file in the other repository blocks", async () => {
+    await env.goal(["--record", "--slug", "both"], goalFor(api));
+    await env.check("--start");
+    writeFileSync(path.join(api, "README.md"), "hi\n");
+    const [code, output] = await env.check();
+    assert.equal(code, EXIT_BLOCK, output);
+    assert.ok(output.includes("NEXT: ask the user: api/README.md not listed"), output);
+  });
+
+  test("a started task keeps its repositories", async () => {
+    await env.goal(["--record", "--slug", "both"], goalFor(api));
+    await env.check("--start");
+    const [code, output] = await env.goal(["--revise"], GOAL);
+    assert.equal(code, EXIT_PRECONDITION);
+    assert.ok(output.includes("a started task keeps its repositories"), output);
   });
 });

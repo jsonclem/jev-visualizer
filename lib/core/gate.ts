@@ -6,6 +6,7 @@ import { num } from "./config.ts";
 import { changedPaths, diff, splitFiles } from "./gitutil.ts";
 import * as goalfmt from "./goalfmt.ts";
 import type { Goal } from "./goalfmt.ts";
+import { qualify, type Repos } from "./repos.ts";
 import * as jev from "./jev.ts";
 import type { Questions } from "./jev.ts";
 import type { Record_ } from "./tasks.ts";
@@ -102,18 +103,24 @@ export function chunks(state: Record<string, unknown>, fileDiff: string, questio
   return groups;
 }
 
-// Per changed file since HEAD: [{path, verdict, confidence, drift{...}}].
+// Per changed file since HEAD, in every repository with changes:
+// [{path, verdict, confidence, drift{...}}].
 //
 // Jev sees only the objectives that list the file, plus every rule and
 // out-of-scope item: a smaller request, and the part of the goal that applies.
-export async function scope(root: string, goal: Goal, tree: string, head: string) {
-  const text = diff(root, "HEAD", tree, { context: num("diff.scope_context_lines") });
-  if (text === null) die(EXIT_ESCALATE, "ESCALATE: could not diff the change against HEAD.");
+export async function scope(repos: Repos, goal: Goal, trees: Record<string, string>, changed: string[]) {
   const questions = scopeQuestions();
   const rules = goal.rules.map((r) => `${r.id}: ${r.text}`);
   const outOfScope = goal.out_of_scope.map((x) => `${x.id}: ${x.text}`);
+  const files: [string, string][] = [];
+  for (const name of changed) {
+    const text = diff(repos.paths[name], "HEAD", trees[name],
+      { context: num("diff.scope_context_lines"), prefix: repos.multi ? name : undefined });
+    if (text === null) die(EXIT_ESCALATE, `ESCALATE: could not diff ${name} against HEAD.`);
+    files.push(...splitFiles(text));
+  }
   const results: ScopeResult[] = [];
-  for (const [path, fileDiff] of splitFiles(text)) {
+  for (const [path, fileDiff] of files) {
     const state = {
       objectives: goalfmt.owners(goal, path).map(goalfmt.render),
       rules,
@@ -130,7 +137,7 @@ export async function scope(root: string, goal: Goal, tree: string, head: string
     let worst: ScopeResult | null = null;
     for (const [n, part] of parts.entries()) {
       const answers = await jev.ask({ ...state, diff: part }, questions, "scope",
-        { file: path, part: `${n + 1}/${parts.length}`, head, tree });
+        { file: path, part: `${n + 1}/${parts.length}`, trees });
       const result: ScopeResult = {
         path,
         verdict: answers.verdict.choice as string,
@@ -170,26 +177,49 @@ export function judgeScope(results: ScopeResult[]) {
   return { blocked, tripped, unsure, drift };
 }
 
-// {id: record} for every objective, against the whole change since `base`.
+// {id: record} for every objective, against the whole change since the task began.
 //
-// Each objective sees only its own files, with whole enclosing functions when
-// they fit and a few lines of context when they do not. A record is reused
-// while the objective's text and its diff are unchanged.
-export async function completion(root: string, goal: Goal, base: string, tree: string, previous: Record<string, Record_>) {
-  const changed = changedPaths(root, base, tree);
+// Each objective sees only its own files, across every repository, with whole
+// enclosing functions when they fit and a few lines of context when they do
+// not. A record is reused while the objective's text and its diff are unchanged.
+export async function completion(
+  repos: Repos,
+  goal: Goal,
+  base: Record<string, string>,
+  trees: Record<string, string>,
+  previous: Record<string, Record_>,
+) {
+  const changed = repos.names.flatMap((name) =>
+    changedPaths(repos.paths[name], base[name], trees[name]).map((p) => [name, p, qualify(repos, name, p)]));
   const questions = completionQuestions();
   const records: Record<string, Record_> = {};
+
+  // The objective's files, across repositories, as one diff. null if git fails.
+  const diffOf = (matched: string[][], options: { context?: number; functionContext?: boolean }) => {
+    const parts: string[] = [];
+    for (const name of repos.names) {
+      const inRepo = matched.filter(([repo]) => repo === name).map(([, p]) => p);
+      if (!inRepo.length) continue;
+      const text = diff(repos.paths[name], base[name], trees[name],
+        { ...options, paths: inRepo, prefix: repos.multi ? name : undefined });
+      if (text === null) return null;
+      parts.push(text);
+    }
+    return parts.join("");
+  };
+
   for (const objective of goal.objectives) {
-    const files = changed.filter((p) => objective.files.some((f) => goalfmt.matches(f, p)));
+    const matched = changed.filter(([, , q]) => objective.files.some((f) => goalfmt.matches(f, q)));
+    const files = matched.map(([, , q]) => q);
     if (!files.length) {
       records[objective.id] = { state: "pending", reason: "no changes in its files yet", files: [] };
       continue;
     }
     const state = { objective: goalfmt.render(objective) };
-    let text = diff(root, base, tree, { paths: files, functionContext: true });
+    let text = diffOf(matched, { functionContext: true });
     let mode = "function";
     if (text !== null && !jev.fits({ ...state, diff: text }, questions)) {
-      text = diff(root, base, tree, { paths: files, context: num("diff.completion_fallback_lines") });
+      text = diffOf(matched, { context: num("diff.completion_fallback_lines") });
       mode = `U${num("diff.completion_fallback_lines")}`;
     }
     if (text === null) die(EXIT_ESCALATE, `ESCALATE: could not diff ${objective.id}'s files.`);
@@ -208,7 +238,7 @@ export async function completion(root: string, goal: Goal, base: string, tree: s
       continue;
     }
     const answers = await jev.ask({ ...state, diff: text }, questions, "completion",
-      { id: objective.id, base, tree, files, diff: mode });
+      { id: objective.id, base, trees, files, diff: mode });
     const score = answers.met.noul as number;
     records[objective.id] = {
       state: score >= num("completion.item_complete") ? "met" : "not_met",
@@ -218,17 +248,27 @@ export async function completion(root: string, goal: Goal, base: string, tree: s
   return records;
 }
 
-// {id: record}. Runs only when every objective is met; a pass is reused for the same tree.
-export async function runVerify(root: string, goal: Goal, tree: string, previous: Record<string, Record_>, logDir: string) {
+// {id: record}. Runs only when every objective is met, each command in its own
+// repository; a pass is reused while that repository's tree is the same.
+export async function runVerify(
+  repos: Repos,
+  goal: Goal,
+  trees: Record<string, string>,
+  previous: Record<string, Record_>,
+  logDir: string,
+) {
   const records: Record<string, Record_> = {};
   for (const check of goal.verify) {
+    const name = check.repo || repos.names[0];
+    const tree = trees[name];
     const old = previous[check.id] ?? {};
     if (old.state === "passed" && old.tree === tree && old.command === check.command) {
       records[check.id] = old;
       continue;
     }
-    const result = await runCheck(check, root, logDir, num("verify.timeout_seconds"), num("verify.requires_timeout_seconds"));
-    records[check.id] = { ...result, tree, at: now() };
+    const result = await runCheck(check, repos.paths[name], logDir,
+      num("verify.timeout_seconds"), num("verify.requires_timeout_seconds"));
+    records[check.id] = { ...result, repo: name, tree, at: now() };
   }
   return records;
 }

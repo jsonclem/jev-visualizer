@@ -2,7 +2,8 @@
 The goal format. Parsing and structure checks are plain code, never Jev.
 
     # <title>
-    Repo: <repository folder name>
+    Repo: <repository folder name, or path>
+    Repo: <another repository path>       (optional: one line per repository)
     <optional summary lines>
 
     ## Objectives
@@ -19,9 +20,14 @@ The goal format. Parsing and structure checks are plain code, never Jev.
     ## Verify
     - V1: <shell command; exit 0 means pass>
       Requires: <optional shell command; nonzero means V1 couldn't run>
+      In: <repository name; required when the goal lists more than one>
 
 Objectives and Verify are required; Rules and Out of scope are optional.
 Sections appear in this order, each at most once.
+
+A bare `Repo:` name means the repository the command runs in. A path names
+another; its folder name is its name. With more than one repository, every
+Files path starts with a repository name: `<repo>/<path>`.
 */
 
 import { capitalize, splitLines } from "./common.ts";
@@ -36,14 +42,15 @@ const OBJECTIVE = /^### (\S+)(?:\s+(.*\S))?\s*$/;
 const ITEM = /^[-*]\s+(\S+?):\s*(.*?)\s*$/;
 const FILES = /^Files:\s*(.*?)\s*$/;
 const REQUIRES = /^Requires:\s*(.*?)\s*$/;
+const IN = /^In:\s*(.*?)\s*$/;
 const ID = /^([A-Z])([1-9]\d*)$/;
 
 export type Objective = { id: string; title: string; files: string[]; text: string };
 export type Item = { id: string; text: string };
-export type Check = { id: string; command: string; requires: string };
+export type Check = { id: string; command: string; requires: string; repo: string };
 export type Goal = {
   title: string;
-  repo: string;
+  repos: string[];
   summary: string;
   objectives: Objective[];
   rules: Item[];
@@ -52,7 +59,7 @@ export type Goal = {
 };
 
 export function emptyGoal(): Goal {
-  return { title: "", repo: "", summary: "", objectives: [], rules: [], out_of_scope: [], verify: [] };
+  return { title: "", repos: [], summary: "", objectives: [], rules: [], out_of_scope: [], verify: [] };
 }
 
 // The objective as Jev reads it, and as versions are compared.
@@ -69,12 +76,12 @@ export function ids(goal: Goal) {
 export function toDict(goal: Goal) {
   return {
     title: goal.title,
-    repo: goal.repo,
+    repos: goal.repos,
     summary: goal.summary,
     objectives: goal.objectives.map((o) => ({ id: o.id, title: o.title, files: o.files, text: o.text })),
     rules: goal.rules.map((i) => ({ id: i.id, text: i.text })),
     out_of_scope: goal.out_of_scope.map((i) => ({ id: i.id, text: i.text })),
-    verify: goal.verify.map((c) => ({ id: c.id, command: c.command, requires: c.requires })),
+    verify: goal.verify.map((c) => ({ id: c.id, command: c.command, requires: c.requires, repo: c.repo })),
   };
 }
 
@@ -155,8 +162,9 @@ export function parse(text: string): [Goal, string[]] {
     if (section === null) {
       match = REPO.exec(line);
       if (match) {
-        if (goal.repo) errors.push(`line ${n}: 'Repo:' appears twice.`);
-        goal.repo = match[1];
+        if (goal.repos.includes(match[1])) errors.push(`line ${n}: 'Repo: ${match[1]}' appears twice.`);
+        else if (match[1]) goal.repos.push(match[1]);
+        else errors.push(`line ${n}: 'Repo:' names no repository.`);
       } else if (line.trim()) {
         summary.push(line.trim());
       }
@@ -225,7 +233,7 @@ export function parse(text: string): [Goal, string[]] {
         return;
       }
       if (section === "verify") {
-        const check = { kind: "check" as const, id: match[1], command: unquote(match[2]), requires: "" };
+        const check = { kind: "check" as const, id: match[1], command: unquote(match[2]), requires: "", repo: "" };
         current = check;
         goal.verify.push(check);
         if (!check.command) errors.push(`${check.id}: has no command.`);
@@ -240,8 +248,13 @@ export function parse(text: string): [Goal, string[]] {
       const open = current as (Item & { kind: "item" }) | (Check & { kind: "check" });
       if (open.kind === "check") {
         const requires = REQUIRES.exec(line.trim());
+        const where = IN.exec(line.trim());
         if (requires && !open.requires) open.requires = unquote(requires[1]);
-        else errors.push(`${open.id}: only one indented 'Requires: <command>' line may follow a Verify command.`);
+        else if (where && !open.repo) open.repo = where[1];
+        else {
+          errors.push(`${open.id}: a Verify command may be followed only by one indented ` +
+            "'Requires: <command>' line and one indented 'In: <repository>' line.");
+        }
       } else {
         open.text = `${open.text} ${line.trim()}`.trim();
       }
@@ -254,11 +267,30 @@ export function parse(text: string): [Goal, string[]] {
   goal.summary = summary.join("\n");
 
   if (!goal.title) errors.push("the goal is empty.");
-  if (!goal.repo) errors.push("missing 'Repo: <repository folder name>' under the title.");
+  if (!goal.repos.length) errors.push("missing 'Repo: <repository folder name>' under the title.");
   if (!goal.objectives.length) errors.push("no objectives. Add '## Objectives' with at least one '### O1'.");
   if (!goal.verify.length) errors.push("no Verify commands. Add '## Verify' with at least one '- V1: <command>'.");
   for (const item of [...goal.rules, ...goal.out_of_scope]) {
     if (!item.text) errors.push(`${item.id}: is empty.`);
+  }
+  const names = goal.repos.map(repoName);
+  if (new Set(names).size !== names.length) errors.push("two Repo: lines have the same folder name.");
+  if (names.length > 1) {
+    const prefixes = names.map((name) => `${name}/`).join(" or ");
+    for (const objective of goal.objectives) {
+      for (const pattern of objective.files) {
+        if (pattern !== "(missing)" && !names.includes(pattern.split("/")[0])) {
+          errors.push(`${objective.id}: file '${pattern}' must start with a repository name (${prefixes}).`);
+        }
+      }
+    }
+  }
+  for (const check of goal.verify) {
+    if (names.length > 1 && !check.repo) {
+      errors.push(`${check.id}: add an indented 'In: <repository>' line (${names.join(" or ")}).`);
+    } else if (check.repo && !names.includes(check.repo)) {
+      errors.push(`${check.id}: 'In: ${check.repo}' is not one of the goal's repositories (${names.join(", ")}).`);
+    }
   }
   const seenIds = new Set<string>();
   for (const id of ids(goal)) {
@@ -271,6 +303,15 @@ export function parse(text: string): [Goal, string[]] {
 // Drop the parser's bookkeeping so a Goal is plain data.
 function strip(goal: Goal): Goal {
   return fromDict(toDict(goal));
+}
+
+// A Repo: entry is a path when it has a slash or starts with ~; its name is its folder.
+export function isRepoPath(spec: string) {
+  return spec.includes("/") || spec.startsWith("~");
+}
+
+export function repoName(spec: string) {
+  return isRepoPath(spec) ? spec.replace(/\/+$/, "").split("/").at(-1)! : spec;
 }
 
 export function badPattern(pattern: string) {
@@ -327,7 +368,7 @@ export function compare(old: Goal, next: Goal) {
   const changes: string[] = [];
   for (const [label, a, b] of [
     ["title", old.title, next.title],
-    ["Repo", old.repo, next.repo],
+    ["Repo", old.repos.join("\n"), next.repos.join("\n")],
     ["summary", old.summary, next.summary],
   ]) {
     if (a !== b) changes.push(`${label} changed`);
@@ -337,7 +378,7 @@ export function compare(old: Goal, next: Goal) {
     new Map<string, string>([
       ...goal.objectives.map((o) => [o.id, render(o)] as [string, string]),
       ...[...goal.rules, ...goal.out_of_scope].map((i) => [i.id, i.text] as [string, string]),
-      ...goal.verify.map((c) => [c.id, `${c.command}\n${c.requires}`] as [string, string]),
+      ...goal.verify.map((c) => [c.id, `${c.command}\n${c.requires}\n${c.repo}`] as [string, string]),
     ]);
 
   const a = keyed(old);
@@ -355,11 +396,11 @@ export function compare(old: Goal, next: Goal) {
 export function fromDict(data: ReturnType<typeof toDict>): Goal {
   return {
     title: data.title,
-    repo: data.repo,
+    repos: [...data.repos],
     summary: data.summary ?? "",
     objectives: data.objectives.map((o) => ({ id: o.id, title: o.title, files: [...o.files], text: o.text })),
     rules: data.rules.map((i) => ({ id: i.id, text: i.text })),
     out_of_scope: data.out_of_scope.map((i) => ({ id: i.id, text: i.text })),
-    verify: data.verify.map((c) => ({ id: c.id, command: c.command, requires: c.requires })),
+    verify: data.verify.map((c) => ({ id: c.id, command: c.command, requires: c.requires, repo: c.repo ?? "" })),
   };
 }

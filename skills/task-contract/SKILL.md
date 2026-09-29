@@ -29,6 +29,10 @@ machine unless the user has accepted that.
 A step is one coherent change toward the objective `NEXT:` names, not every
 file save. Change only files listed on an objective's `Files:` line.
 
+A task can cover several repositories. Run `CHECK` from inside any of them:
+it checks the changes in all of them, and `CHECK --commit` commits each
+repository that has changes, with the same message.
+
 1. Make the change.
 2. Run `CHECK`.
 3. Act on the exit code:

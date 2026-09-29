@@ -25,13 +25,13 @@ export type Kind =
 
 export type Objective = { id: string; title: string; files: string[]; text: string };
 export type Item = { id: string; text: string };
-export type Check = { id: string; command: string; requires: string };
+export type Check = { id: string; command: string; requires: string; repo: string };
 
 // goal.json, written by goal.py from the approved goal.md.
 export type Goal = {
   version: number;
   title: string;
-  repo: string;
+  repos: string[];
   summary: string;
   objectives: Objective[];
   rules: Item[];
@@ -95,9 +95,9 @@ export type TaskEvent = {
   complete?: boolean;
   next?: string;
   has_changes?: boolean;
-  sha?: string;
+  shas?: Record<string, string>;
   subject?: string;
-  base?: string;
+  base?: Record<string, string>;
 };
 
 export type Config = Record<string, number | string>;
@@ -105,9 +105,8 @@ export type Config = Record<string, number | string>;
 export type Task = {
   id: string;
   title: string;
-  repo: string;
+  repo: string; // the repositories' names, joined for display
   repoPath: string;
-  baseCommit: string;
   status: Status;
   created: string | null;
   closed: string | null;
@@ -124,8 +123,7 @@ export type Task = {
 
 type Meta = {
   slug?: string;
-  repo?: string;
-  base_commit?: string | null;
+  repos?: Record<string, string>;
   created?: string;
   closed?: string;
   status?: string;
@@ -220,9 +218,8 @@ async function readTask(id: string): Promise<Task | null> {
   return {
     id,
     title: goal?.title || humanize(meta.slug || id),
-    repo: meta.repo ? path.basename(meta.repo) : "unknown repo",
-    repoPath: meta.repo ?? "",
-    baseCommit: meta.base_commit ?? "",
+    repo: Object.keys(meta.repos ?? {}).join(" + ") || "unknown repo",
+    repoPath: Object.values(meta.repos ?? {}).join("\n"),
     status:
       status === "ready" || status === "active" || status === "complete" || status === "closed" ? status : "unknown",
     created: meta.created ?? null,

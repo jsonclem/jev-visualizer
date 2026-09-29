@@ -241,7 +241,7 @@ async function direct(
       return;
     }
     case "commit":
-      await stage.station(event.sha ?? "", event.subject ?? "");
+      await stage.station(Object.values(event.shas ?? {}).join(" "), event.subject ?? "");
       return;
     case "complete":
       await stage.planet();
@@ -475,6 +475,7 @@ function Objectives({ task, shown, drained }: { task: Task; shown: TaskEvent[]; 
   const current = records(task, shown, drained);
   const objectives = goal?.objectives ?? [];
   const checks = goal?.verify ?? [];
+  const multi = (goal?.repos.length ?? 0) > 1;
   const met = objectives.filter((o) => current.objectives[o.id]?.state === "met").length;
   const passed = checks.filter((c) => current.verify[c.id]?.state === "passed").length;
   const versions = task.events.filter((event) => event.kind === "record" || event.kind === "revise");
@@ -522,6 +523,7 @@ function Objectives({ task, shown, drained }: { task: Task; shown: TaskEvent[]; 
                 id={check.id}
                 command={check.command}
                 requires={check.requires}
+                repo={multi ? check.repo : ""}
                 record={current.verify[check.id] ?? { state: "pending" }}
                 log={drained ? task.logs[check.id] : undefined}
               />
@@ -657,12 +659,14 @@ function VerifyRow({
   id,
   command,
   requires,
+  repo,
   record,
   log,
 }: {
   id: string;
   command: string;
   requires: string;
+  repo: string;
   record: VerifyRecord;
   log?: string;
 }) {
@@ -679,6 +683,7 @@ function VerifyRow({
             {command}
           </code>
         </p>
+        {repo && <p className="truncate font-mono text-[10px] text-faint">in {repo}</p>}
         {requires && (
           <p className="truncate font-mono text-[10px] text-faint" title={requires}>
             requires {requires}
@@ -756,16 +761,19 @@ function FlightLog({ shown, config }: { shown: TaskEvent[]; config: Task["config
 
 function Detail({ event }: { event: TaskEvent }) {
   if (event.kind === "commit") {
+    const shas = Object.entries(event.shas ?? {});
     return (
       <p className="mt-0.5">
-        <code className="font-mono text-[11px] text-faint">{event.sha}</code>{" "}
+        <code className="font-mono text-[11px] text-faint">
+          {shas.map(([name, sha]) => (shas.length > 1 ? `${name} ${sha}` : sha)).join(" · ")}
+        </code>{" "}
         <span className="font-display text-[15px] leading-tight">{event.subject}</span>
       </p>
     );
   }
   const chips: [string, string, boolean?][] = [];
   if (event.version) chips.push(["version", String(event.version)]);
-  if (event.base) chips.push(["base", event.base]);
+  if (event.base) chips.push(["base", Object.values(event.base).join(" · ")]);
   if (event.objectives) {
     const all = Object.values(event.objectives);
     chips.push(["met", `${all.filter((r) => r.state === "met").length}/${all.length}`]);

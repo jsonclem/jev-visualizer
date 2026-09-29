@@ -42,11 +42,11 @@ export function optionalRoot() {
   return rc === 0 && root.trim() ? root.trim() : null;
 }
 
-export function requireClean(root: string) {
+export function requireClean(root: string, name?: string) {
   const [, status] = git(root, ["status", "--porcelain"]);
   if (status.trim()) {
     die(EXIT_PRECONDITION,
-      "PRECONDITION FAILED: working tree is not clean.",
+      `PRECONDITION FAILED: working tree is not clean${name ? ` in ${name}` : ""}.`,
       "Commit or stash your own changes first. Nothing was modified.",
       "",
       status.trimEnd());
@@ -96,14 +96,16 @@ export function changedPaths(root: string, since: string, tree: string) {
   return splitLines(names).filter((n) => n.trim());
 }
 
-// Unified diff, optionally limited to `paths`. null if git fails.
+// Unified diff, optionally limited to `paths`. null if git fails. With `prefix`,
+// file names read `<prefix>/<path>`, so a diff names its repository.
 export function diff(
   root: string,
   since: string,
   tree: string,
-  options: { paths?: string[]; context?: number; functionContext?: boolean } = {},
+  options: { paths?: string[]; context?: number; functionContext?: boolean; prefix?: string } = {},
 ) {
   const args = ["diff", "--no-color", "--no-ext-diff", "--no-renames"];
+  if (options.prefix) args.push(`--src-prefix=a/${options.prefix}/`, `--dst-prefix=b/${options.prefix}/`);
   args.push(options.functionContext ? "--function-context" : `-U${options.context ?? 0}`);
   args.push(since, tree);
   if (options.paths) args.push("--", ...options.paths.map((p) => `:(literal)${p}`));

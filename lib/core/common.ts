@@ -9,7 +9,6 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
 // Mutable so tests can point them at a temporary folder.
 export const paths = {
-  root: ROOT,
   config: path.join(ROOT, "config.json"),
   tasks: path.join(ROOT, "history"),
   // Outside the skill folders, so sharing a skill never shares the key.

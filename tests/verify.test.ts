@@ -16,7 +16,7 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const runOne = (command: string, requires = "", timeout = 10) =>
-  runCheck({ id: "V1", command, requires }, root, logs, timeout, 5);
+  runCheck({ id: "V1", command, requires, repo: "" }, root, logs, timeout, 5);
 
 test("passed writes no log", async () => {
   const result = await runOne("true");

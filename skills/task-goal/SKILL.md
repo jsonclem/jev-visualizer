@@ -16,7 +16,8 @@ text that must not leave the machine unless the user has accepted that.
 
 ```markdown
 # <title>
-Repo: <repository folder name>
+Repo: <repository folder name, or its path>
+Repo: <another repository's path>          (one line per repository)
 <optional one-paragraph summary>
 
 ## Objectives
@@ -34,6 +35,7 @@ Files: <path>, <path or pattern>
 ## Verify
 - V1: <shell command run from the repository root; exit 0 means pass>
   Requires: <optional shell command; if it fails, V1 couldn't run rather than failed>
+  In: <repository name; required when the goal has more than one Repo:>
 ```
 
 - Objectives are the only items that count toward done. Each is one condition
@@ -45,6 +47,11 @@ Files: <path>, <path or pattern>
 - Verify holds the commands that prove the work, such as the tests to run.
   Use `Requires:` for what they need running, such as a database.
 - IDs are never renumbered. A removed ID is never reused.
+- A task can cover several repositories. `Repo:` with a bare name means the
+  repository you run the command in; a path (`~/code/api`) adds another, named
+  after its folder. With more than one, every `Files:` path starts with that
+  name (`api/src/routes.ts`) and every Verify command has an `In:` line.
+  Record the goal from inside one of its repositories.
 
 ## Writing a goal
 

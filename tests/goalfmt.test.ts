@@ -12,7 +12,7 @@ describe("parse", () => {
     const [goal, errors] = goalfmt.parse(GOAL);
     assert.deepEqual(errors, []);
     assert.equal(goal.title, "Demo task");
-    assert.equal(goal.repo, "demo");
+    assert.deepEqual(goal.repos, ["demo"]);
     assert.equal(goal.summary, "A small task for tests.");
     assert.deepEqual(goal.objectives.map((o) => o.id), ["O1", "O2"]);
     assert.equal(goal.objectives[0].title, "First file");
@@ -55,7 +55,7 @@ describe("parse", () => {
       "says nothing after its Files": GOAL.replace("a.txt says DONE.\n", ""),
       "must be relative": GOAL.replace("Files: a.txt", "Files: /etc/passwd"),
       "must not contain '..'": GOAL.replace("Files: a.txt", "Files: ../x"),
-      "only one indented 'Requires": GOAL.replace("grep -q DONE b.txt", "grep -q DONE b.txt\n  Also: x"),
+      "may be followed only by one indented": GOAL.replace("grep -q DONE b.txt", "grep -q DONE b.txt\n  Also: x"),
       "holds only '- R<number>": GOAL.replace("- R1: Keep", "R1 Keep"),
     };
     for (const [expected, text] of Object.entries(cases)) {
@@ -114,5 +114,63 @@ describe("compare", () => {
   test("no changes", () => {
     const [old] = goalfmt.parse(GOAL);
     assert.deepEqual(goalfmt.compare(old, old), []);
+  });
+});
+
+const MULTI = `# Two repos
+Repo: web
+Repo: ~/code/api
+
+## Objectives
+
+### O1
+Files: web/a.txt
+a.txt says DONE.
+
+### O2
+Files: api/server.txt, api/routes/
+server.txt says DONE.
+
+## Verify
+- V1: grep -q DONE a.txt
+  In: web
+- V2: grep -q DONE server.txt
+  Requires: true
+  In: api
+`;
+
+describe("several repositories", () => {
+  test("parse", () => {
+    const [goal, errors] = goalfmt.parse(MULTI);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(goal.repos, ["web", "~/code/api"]);
+    assert.deepEqual(goal.repos.map(goalfmt.repoName), ["web", "api"]);
+    assert.deepEqual(goal.verify.map((c) => [c.id, c.repo, c.requires]), [["V1", "web", ""], ["V2", "api", "true"]]);
+  });
+
+  test("structure errors", () => {
+    const cases: Record<string, string> = {
+      "must start with a repository name (web/ or api/)": MULTI.replace("Files: web/a.txt", "Files: a.txt"),
+      "add an indented 'In: <repository>' line (web or api)": MULTI.replace("  In: web\n", ""),
+      "'In: cli' is not one of the goal's repositories": MULTI.replace("In: api", "In: cli"),
+      "two Repo: lines have the same folder name": MULTI.replace("Repo: web", "Repo: ~/other/api"),
+      "'Repo: web' appears twice": MULTI.replace("Repo: web\n", "Repo: web\nRepo: web\n"),
+    };
+    for (const [expected, text] of Object.entries(cases)) {
+      const errors = goalfmt.parse(text)[1];
+      assert.ok(errors.some((e) => e.includes(expected)), `${expected}: ${JSON.stringify(errors)}`);
+    }
+  });
+
+  test("one repository needs no prefixes or In", () => {
+    assert.deepEqual(goalfmt.parse(GOAL)[1], []);
+    const errors = goalfmt.parse(GOAL.replace("grep -q DONE b.txt", "grep -q DONE b.txt\n  In: other"))[1];
+    assert.ok(errors.some((e) => e.includes("'In: other' is not one of the goal's repositories")), JSON.stringify(errors));
+  });
+
+  test("compare sees repositories and In", () => {
+    const [old] = goalfmt.parse(MULTI);
+    const [next] = goalfmt.parse(MULTI.replace("  In: web\n", "  In: api\n").replace("Repo: ~/code/api", "Repo: ~/src/api"));
+    assert.deepEqual(goalfmt.compare(old, next), ["Repo changed", "V1 changed"]);
   });
 });

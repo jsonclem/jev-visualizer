@@ -26,37 +26,57 @@ import * as goalfmt from "../lib/core/goalfmt.ts";
 import type { Goal } from "../lib/core/goalfmt.ts";
 import { git, gitRoot, optionalRoot } from "../lib/core/gitutil.ts";
 import * as jev from "../lib/core/jev.ts";
+import { resolveRepos, unqualify, type Repos } from "../lib/core/repos.ts";
 import * as tasks from "../lib/core/tasks.ts";
 
-// [goal, notes] or stop with every structural error. Plain code only.
-function structure(text: string, root: string | null): [Goal, string[]] {
+// [goal, repos, notes] or stop with every structural error. Plain code only.
+function structure(text: string, root: string | null): [Goal, Repos, string[]] {
   const [goal, errors] = goalfmt.parse(text);
-  if (root !== null && goal.repo && goal.repo !== path.basename(root)) {
-    errors.push(`Repo: says '${goal.repo}', but this repository is '${path.basename(root)}'. ` +
-      "A task covers one repository.");
-  }
-  if (errors.length) {
+  const [repos, repoErrors, notes] = errors.length ? [null, [], []] : resolveRepos(goal, root);
+  errors.push(...repoErrors);
+  if (errors.length || !repos) {
     die(EXIT_PRECONDITION,
       "NOT READY: the goal does not follow the format. Nothing was sent to Jev.",
       ...errors.map((e) => `  - ${e}`));
   }
-  const notes: string[] = [];
-  if (root !== null) {
-    const [, tracked] = git(root, ["ls-files"]);
-    const existing = tracked.split("\n").filter(Boolean);
-    for (const objective of goal.objectives) {
-      for (const pattern of objective.files) {
-        if (/[*?]/.test(pattern) || pattern.endsWith("/")) {
-          if (!existing.some((p) => goalfmt.matches(pattern, p))) {
-            notes.push(`${objective.id}: '${pattern}' matches no tracked file yet.`);
-          }
-        } else if (!existsSync(path.join(root, pattern))) {
-          notes.push(`${objective.id}: '${pattern}' does not exist yet (fine if the task creates it).`);
+  const tracked: Record<string, string[]> = {};
+  for (const objective of goal.objectives) {
+    for (const pattern of objective.files) {
+      const [name, inRepo] = unqualify(repos, pattern);
+      const root = repos.paths[name];
+      if (!root) continue;
+      tracked[name] ??= git(root, ["ls-files"])[1].split("\n").filter(Boolean);
+      if (/[*?]/.test(inRepo) || inRepo.endsWith("/")) {
+        if (!tracked[name].some((p) => goalfmt.matches(inRepo, p))) {
+          notes.push(`${objective.id}: '${pattern}' matches no tracked file yet.`);
         }
+      } else if (!existsSync(path.join(root, inRepo))) {
+        notes.push(`${objective.id}: '${pattern}' does not exist yet (fine if the task creates it).`);
       }
     }
   }
-  return [goal, notes];
+  return [goal, repos, notes];
+}
+
+// Recording and revising run from inside one of the goal's repositories, so the
+// task can be found again from any of them.
+function requireInside(repos: Repos, root: string) {
+  if (!Object.values(repos.paths).includes(root)) {
+    die(EXIT_PRECONDITION,
+      `PRECONDITION FAILED: this repository (${root}) is not one of the goal's repositories.`,
+      "Run it from inside one of them.");
+  }
+}
+
+// Stop if any of the goal's repositories is already in another open task.
+function requireFree(repos: Repos, except: string | null = null) {
+  const taken = [...new Set(Object.values(repos.paths).flatMap((p) => tasks.find(p)))].filter((t) => t !== except);
+  if (taken.length) {
+    die(EXIT_PRECONDITION,
+      "PRECONDITION FAILED: a repository in this goal already has an open task.",
+      "To change that task's goal, use goal.ts --revise from inside it. To start over, the user closes it first (check.ts --close).",
+      ...taken.map((t) => `  ${t}`));
+  }
 }
 
 const noteLines = (notes: string[]) => (notes.length ? ["", "Notes:", ...notes.map((n) => `  ${n}`)] : []);
@@ -65,13 +85,13 @@ async function cmdCheck() {
   const text = readStdin();
   if (!text) die(EXIT_PRECONDITION, "PRECONDITION FAILED: no goal on stdin.");
   const root = optionalRoot();
-  const [goal, notes] = structure(text, root);
+  const [goal, , notes] = structure(text, root);
   const [ok, report] = await clarity.check(text, goal);
   out((ok ? "READY" : "NOT READY") + `: ${goal.objectives.length} objectives, ` +
     `${goal.rules.length} rules, ${goal.out_of_scope.length} out of scope, ${goal.verify.length} verify.`,
   ...report,
   ...noteLines(notes),
-  root ? "" : "Not inside a git repository: Repo: and Files: were not checked against it.");
+  "");
   if (!ok) {
     out("Show the user what is not ready. Record nothing until they approve new wording.");
     return EXIT_PRECONDITION;
@@ -85,27 +105,22 @@ async function cmdRecord(slugArg: string) {
   const root = gitRoot();
   const text = readStdin();
   if (!text) die(EXIT_PRECONDITION, "PRECONDITION FAILED: no goal on stdin.", "Pipe the goal the user approved, verbatim.");
-  const openTasks = tasks.find(root);
-  if (openTasks.length) {
-    die(EXIT_PRECONDITION,
-      "PRECONDITION FAILED: this repository already has an open task.",
-      "To change its goal, use goal.ts --revise. To start over, the user closes it first (check.ts --close).",
-      ...openTasks.map((t) => `  ${t}`));
-  }
-  const [goal, notes] = structure(text, root);
+  const [goal, repos, notes] = structure(text, root);
+  requireInside(repos, root);
+  requireFree(repos);
   const [ok, report, results] = await clarity.check(text, goal);
   if (!ok) die(EXIT_PRECONDITION, "NOT READY: nothing was recorded.", ...report);
 
   const slug = tasks.slugify(slugArg) || tasks.slugify(goal.title);
   if (!slug) die(EXIT_PRECONDITION, "PRECONDITION FAILED: --slug produced an empty name.");
-  const task = tasks.create(root, slug, today());
+  const task = tasks.create(repos.names, slug, today());
   const goalText = text + "\n";
   tasks.writeGoal(task, goalText, 1, goal);
   tasks.writeMeta(task, {
     id: path.basename(task),
     slug,
-    repo: root,
-    base_commit: null,
+    repos: repos.paths,
+    base: null,
     goal_version: 1,
     goal_hash: textHash(goalText),
     retired_ids: [],
@@ -148,7 +163,16 @@ async function cmdRevise() {
     return EXIT_PASS;
   }
   const [old] = goalfmt.parse(oldText);
-  const [goal, notes] = structure(text, root);
+  const [goal, repos, notes] = structure(text, root);
+  requireInside(repos, root);
+  requireFree(repos, task);
+  const sameRepos = JSON.stringify(Object.entries(repos.paths).sort()) === JSON.stringify(Object.entries(meta.repos).sort());
+  if (!sameRepos && meta.status !== "ready") {
+    die(EXIT_PRECONDITION,
+      "NOT READY: a started task keeps its repositories.",
+      `  Recorded: ${Object.keys(meta.repos).join(", ")}   New: ${repos.names.join(", ")}`,
+      "To change them, the user closes this task (check.ts --close) and records a new goal.");
+  }
   const reused = goalfmt.ids(goal).filter((id) => (meta.retired_ids ?? []).includes(id));
   if (reused.length) {
     die(EXIT_PRECONDITION,
@@ -174,6 +198,7 @@ async function cmdRevise() {
     for (const id of touched) delete group[id];
   }
   tasks.writeState(task, tasks.freshState(goal, state));
+  meta.repos = repos.paths;
   meta.goal_version = version;
   meta.goal_hash = textHash(goalText);
   meta.retired_ids = [...new Set([...(meta.retired_ids ?? []), ...removed])].sort();

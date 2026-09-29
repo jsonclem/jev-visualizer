@@ -22,13 +22,13 @@ import type { Goal } from "./goalfmt.ts";
 import * as jev from "./jev.ts";
 import { git, gitPath } from "./gitutil.ts";
 
-export const ACTIVE = ["ready", "active"]; // a repository has at most one task in these states
+export const ACTIVE = ["ready", "active"]; // a repository is in at most one task in these states
 
 export type Meta = {
   id: string;
   slug: string;
-  repo: string;
-  base_commit: string | null;
+  repos: Record<string, string>; // repository name -> git top folder
+  base: Record<string, string> | null; // repository name -> commit the task started from
   goal_version: number;
   goal_hash: string;
   retired_ids: string[];
@@ -45,7 +45,7 @@ export type Record_ = { state: string; reason?: string; score?: number; [key: st
 export type State = {
   objectives: Record<string, Record_>;
   verify: Record<string, Record_>;
-  last_pass: string | null;
+  last_pass: Record<string, string> | null; // repository name -> tree that passed the gate
   last_pass_complete: boolean;
   next: string | null;
 };
@@ -95,7 +95,9 @@ export function find(root: string, statuses: string[] = ACTIVE) {
     const candidate = path.join(paths.tasks, name);
     if (name.startsWith("_") || name.startsWith(".") || !statSync(candidate).isDirectory()) continue;
     const meta = readMeta(candidate);
-    if (meta && meta.repo === root && statuses.includes(meta.status)) matches.push(candidate);
+    if (meta?.repos && Object.values(meta.repos).includes(root) && statuses.includes(meta.status)) {
+      matches.push(candidate);
+    }
   }
   return matches;
 }
@@ -119,8 +121,8 @@ export function resolve(root: string, statuses: string[] = ACTIVE) {
   return matches[0];
 }
 
-export function create(root: string, slug: string, day: string) {
-  const base = `${day}-${path.basename(root)}-${slug}`;
+export function create(names: string[], slug: string, day: string) {
+  const base = `${day}-${names.join("+")}-${slug}`;
   let task = path.join(paths.tasks, base);
   let counter = 2;
   while (existsSync(task)) {

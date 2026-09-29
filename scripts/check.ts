@@ -7,7 +7,8 @@ goal is recorded by task-goal (goal.ts); tunables live in config.json at the
 repository root.
 
 Modes:
-  --start                 Start the ready task for this repository, or resume the active one.
+  --start                 Start the ready task for this repository (and the task's other
+                          repositories), or resume the active one.
   (no arguments)          Gate the change, check each objective, run Verify, print NEXT.
   --commit -m <message>   Commit the gated change locally. Never pushes.
   --accept-config         Accept config.json values the user changed mid-task.
@@ -34,6 +35,7 @@ import {
   changedPaths, git, gitRoot, headSha, headTree, reachable, requireClean, snapshot, usesConventionalCommits,
 } from "../lib/core/gitutil.ts";
 import * as jev from "../lib/core/jev.ts";
+import { fromPaths, qualify, type Repos } from "../lib/core/repos.ts";
 import * as routing from "../lib/core/routing.ts";
 import * as tasks from "../lib/core/tasks.ts";
 import type { Meta, Record_, State } from "../lib/core/tasks.ts";
@@ -86,6 +88,26 @@ function verifyLines(goal: Goal, records: Record<string, Record_>) {
   });
 }
 
+// The task's repositories: each one's current tree and head, and which have
+// uncommitted changes. Plain git; the gate, commit and hook all use these.
+function look(repos: Repos) {
+  const trees: Record<string, string> = {};
+  const heads: Record<string, string> = {};
+  const changed: string[] = [];
+  for (const name of repos.names) {
+    const root = repos.paths[name];
+    trees[name] = snapshot(root);
+    heads[name] = headSha(root);
+    if (trees[name] !== headTree(root)) changed.push(name);
+  }
+  return { trees, heads, changed };
+}
+
+// "abc123" for one repository, "web abc123, api def456" for several.
+function perRepo(repos: Repos, values: Record<string, string>) {
+  return repos.multi ? repos.names.map((name) => `${name} ${values[name]}`).join(", ") : values[repos.names[0]];
+}
+
 // --- Modes --------------------------------------------------------------------
 
 async function cmdStart() {
@@ -96,22 +118,23 @@ async function cmdStart() {
   tasks.verifiedConfig(task, meta);
   const state = tasks.readState(task);
   const goalFile = path.join(task, "goal.md");
+  const repos = fromPaths(meta.repos);
 
   if (meta.status === "ready") {
-    requireClean(root);
-    const sha = headSha(root);
+    for (const name of repos.names) requireClean(repos.paths[name], repos.multi ? name : undefined);
+    const base = Object.fromEntries(repos.names.map((name) => [name, headSha(repos.paths[name])]));
     meta.status = "active";
-    meta.base_commit = sha;
+    meta.base = base;
     meta.started = now();
     tasks.writeMeta(task, meta);
     state.next = `work on ${goal.objectives[0].id} (not started)`;
     tasks.writeState(task, state);
-    const hookNote = tasks.installHook(root, CHECK_PATH);
-    tasks.event(task, "start", { base: sha, version: meta.goal_version });
+    const hookNotes = repos.names.map((name) => tasks.installHook(repos.paths[name], CHECK_PATH));
+    tasks.event(task, "start", { base, version: meta.goal_version });
     out(`STARTED  ${path.basename(task)}`,
       `Goal:    ${goalFile}  (version ${meta.goal_version})`,
-      `Base:    ${sha}`,
-      hookNote,
+      `Base:    ${perRepo(repos, base)}`,
+      ...hookNotes,
       config.handoffLine(),
       "",
       "Objectives:", ...objectiveLines(goal, state.objectives),
@@ -120,16 +143,19 @@ async function cmdStart() {
     return EXIT_PASS;
   }
 
-  const baseNote = reachable(root, meta.base_commit ?? "") ? "" : "  (base commit no longer reachable)";
+  const base = meta.base ?? {};
+  const lost = repos.names.filter((name) => !reachable(repos.paths[name], base[name] ?? ""));
+  const baseNote = lost.length ? `  (base commit no longer reachable: ${lost.join(", ")})` : "";
+  const { trees, heads, changed } = look(repos);
   let pending = "";
-  const tree = snapshot(root);
-  if (tree !== headTree(root)) {
-    pending = tree === state.last_pass ? "passed the gate, not yet committed" : "not yet gated; run check.ts before committing";
+  if (changed.length) {
+    const passed = state.last_pass && repos.names.every((name) => state.last_pass![name] === trees[name]);
+    pending = passed ? "passed the gate, not yet committed" : "not yet gated; run check.ts before committing";
   }
-  tasks.event(task, "resume", { head: headSha(root), uncommitted: pending || null });
+  tasks.event(task, "resume", { heads, uncommitted: pending || null });
   out(`RESUMED  ${path.basename(task)}`,
     `Goal:    ${goalFile}  (version ${meta.goal_version})`,
-    `Base:    ${meta.base_commit}${baseNote}`,
+    `Base:    ${perRepo(repos, base)}${baseNote}`,
     config.handoffLine(),
     ...(pending ? [`Uncommitted changes: ${pending}`] : []),
     "",
@@ -146,12 +172,12 @@ async function cmdGate() {
   const [, goal] = tasks.loadGoal(task, meta);
   tasks.verifiedConfig(task, meta);
   const state = tasks.readState(task);
-  const base = meta.base_commit!;
+  const repos = fromPaths(meta.repos);
+  const base = meta.base!;
 
-  const tree = snapshot(root);
-  const head = headSha(root);
-  const hasChanges = tree !== headTree(root);
-  if (!hasChanges && head === base) {
+  const { trees, heads, changed } = look(repos);
+  const hasChanges = changed.length > 0;
+  if (!hasChanges && repos.names.every((name) => heads[name] === base[name])) {
     tasks.event(task, "gate", { result: "escalate", reason: "no-changes" });
     die(EXIT_ESCALATE,
       "ESCALATE: there are no changes to check.",
@@ -159,18 +185,20 @@ async function cmdGate() {
       `NEXT: ${state.next || "make a change toward the first objective"}, then run check.ts`);
   }
 
-  const record: Record<string, unknown> = { tree, head, has_changes: hasChanges, version: meta.goal_version };
+  const record: Record<string, unknown> = { trees, heads, has_changes: hasChanges, version: meta.goal_version };
   let lines: string[] = [];
 
   if (hasChanges) {
-    const uncovered = goalfmt.uncovered(goal, changedPaths(root, "HEAD", tree));
+    const paths = changed.flatMap((name) =>
+      changedPaths(repos.paths[name], "HEAD", trees[name]).map((p) => qualify(repos, name, p)));
+    const uncovered = goalfmt.uncovered(goal, paths);
     if (uncovered.length) {
       return stop(task, state, record,
         ["BLOCKED: files changed that no objective lists.", ...uncovered.map((p) => `  ${p}`)],
         { uncovered });
     }
 
-    const results = await gate.scope(root, goal, tree, head);
+    const results = await gate.scope(repos, goal, trees, changed);
     const { blocked, tripped, unsure, drift } = gate.judgeScope(results);
     Object.assign(record, { scope: results, drift });
     lines = ["Scope:",
@@ -194,20 +222,21 @@ async function cmdGate() {
     }
   }
 
-  const objectives = await gate.completion(root, goal, base, tree, state.objectives ?? {});
+  const objectives = await gate.completion(repos, goal, base, trees, state.objectives ?? {});
   let checks: Record<string, Record_>;
   if (Object.values(objectives).every((r) => r.state === "met")) {
-    checks = await gate.runVerify(root, goal, tree, state.verify ?? {}, path.join(task, "verify"));
-    const after = snapshot(root);
-    if (after !== tree) {
-      // The gate checked `tree`; committing `after` would commit files nobody checked.
-      const changed = changedPaths(root, tree, after);
-      Object.assign(record, { objectives, verify: checks, verify_changed: changed });
+    checks = await gate.runVerify(repos, goal, trees, state.verify ?? {}, path.join(task, "verify"));
+    const after = look(repos).trees;
+    // The gate checked `trees`; committing `after` would commit files nobody checked.
+    const changedByVerify = repos.names.flatMap((name) => after[name] === trees[name] ? []
+      : changedPaths(repos.paths[name], trees[name], after[name]).map((p) => qualify(repos, name, p)));
+    if (changedByVerify.length) {
+      Object.assign(record, { objectives, verify: checks, verify_changed: changedByVerify });
       return stop(task, state, record,
         ["ESCALATE: the Verify commands changed files in the repository.",
-          ...changed.map((p) => `  ${p}`),
+          ...changedByVerify.map((p) => `  ${p}`),
           "Nothing was committed. The user decides."],
-        { verifyChanged: changed });
+        { verifyChanged: changedByVerify });
     }
   } else {
     checks = gate.waitingVerify(goal);
@@ -220,7 +249,7 @@ async function cmdGate() {
 
   Object.assign(state, {
     objectives, verify: checks, next: nextLine,
-    last_pass: hasChanges ? tree : null,
+    last_pass: hasChanges ? trees : null,
     last_pass_complete: complete && hasChanges,
   });
   tasks.writeState(task, state);
@@ -230,20 +259,21 @@ async function cmdGate() {
     meta.status = "complete";
     meta.closed = now();
     tasks.writeMeta(task, meta);
-    tasks.event(task, "complete", { head });
+    tasks.event(task, "complete", { heads });
   }
 
   const met = Object.values(objectives).filter((r) => r.state === "met").length;
-  out(hasChanges ? "PASS: this change is within the recorded goal." : `NO NEW CHANGES: checked the committed work at ${head}.`,
-    ...lines,
-    "",
-    `Objectives (${met}/${goal.objectives.length} met):`, ...objectiveLines(goal, objectives),
-    "Verify:", ...verifyLines(goal, checks),
-    "",
-    complete && !hasChanges ? "GOAL COMPLETE. The task is closed."
-      : complete ? "GOAL COMPLETE once committed." : "GOAL NOT YET COMPLETE.",
-    ...(hasChanges ? ['Commit it with: check.ts --commit -m "<message>"'] : []),
-    `NEXT: ${nextLine}`);
+  out(hasChanges ? "PASS: this change is within the recorded goal."
+    : `NO NEW CHANGES: checked the committed work at ${perRepo(repos, heads)}.`,
+  ...lines,
+  "",
+  `Objectives (${met}/${goal.objectives.length} met):`, ...objectiveLines(goal, objectives),
+  "Verify:", ...verifyLines(goal, checks),
+  "",
+  complete && !hasChanges ? "GOAL COMPLETE. The task is closed."
+    : complete ? "GOAL COMPLETE once committed." : "GOAL NOT YET COMPLETE.",
+  ...(hasChanges ? ['Commit it with: check.ts --commit -m "<message>"'] : []),
+  `NEXT: ${nextLine}`);
   return code;
 }
 
@@ -314,10 +344,11 @@ async function cmdCommit(message: string) {
   const [task, meta] = openTask(root);
   tasks.loadGoal(task, meta);
   const state = tasks.readState(task);
+  const repos = fromPaths(meta.repos);
 
-  const tree = snapshot(root);
-  if (tree === headTree(root)) die(EXIT_ESCALATE, "ESCALATE: there is nothing to commit.");
-  if (tree !== state.last_pass) {
+  const { trees, changed } = look(repos);
+  if (!changed.length) die(EXIT_ESCALATE, "ESCALATE: there is nothing to commit.");
+  if (!state.last_pass || repos.names.some((name) => state.last_pass![name] !== trees[name])) {
     die(EXIT_PRECONDITION,
       "PRECONDITION FAILED: no passing gate for the current changes.",
       "Run check.ts with no arguments and act on its exit code.",
@@ -331,30 +362,45 @@ async function cmdCommit(message: string) {
       "Write a short, plain subject line describing the change.");
   }
 
-  git(root, ["add", "-A"], { check: true });
-  const [, staged] = git(root, ["write-tree"], { check: true });
-  if (staged.trim() !== tree) {
-    die(EXIT_ESCALATE, "ESCALATE: the files changed while committing. Nothing was committed.", "Run check.ts again.");
+  // Stage every repository and confirm each matches what passed before committing any.
+  for (const name of changed) {
+    git(repos.paths[name], ["add", "-A"], { check: true });
+    const [, staged] = git(repos.paths[name], ["write-tree"], { check: true });
+    if (staged.trim() !== trees[name]) {
+      die(EXIT_ESCALATE, "ESCALATE: the files changed while committing. Nothing was committed.", "Run check.ts again.");
+    }
   }
   const full = body.length ? `${subject}\n\n${body.join("\n")}` : subject;
-  const [rc] = git(root, ["commit", "-m", full], { env: { ...process.env, [COMMIT_ENV]: tree } });
-  if (rc !== 0) die(EXIT_ESCALATE, "ESCALATE: git commit failed. Nothing was committed.");
+  const shas: Record<string, string> = {};
+  for (const name of changed) {
+    const [rc] = git(repos.paths[name], ["commit", "-m", full], { env: { ...process.env, [COMMIT_ENV]: trees[name] } });
+    if (rc !== 0) {
+      if (Object.keys(shas).length) tasks.event(task, "commit", { shas, subject, trees, failed: name });
+      die(EXIT_ESCALATE, `ESCALATE: git commit failed in ${name}.`,
+        Object.keys(shas).length
+          ? `Already committed: ${Object.entries(shas).map(([n, sha]) => `${n} ${sha}`).join(", ")}`
+          : "Nothing was committed.");
+    }
+    shas[name] = headSha(repos.paths[name]);
+  }
 
   const complete = state.last_pass_complete ?? false;
   state.last_pass = null;
   state.last_pass_complete = false;
   tasks.writeState(task, state);
-  const sha = headSha(root);
-  tasks.event(task, "commit", { sha, subject, tree });
-  out(`COMMITTED  ${sha}  ${subject}`);
+  tasks.event(task, "commit", { shas, subject, trees });
+  if (repos.multi) out(`COMMITTED  ${subject}`, ...changed.map((name) => `  ${name}  ${shas[name]}`));
+  else out(`COMMITTED  ${shas[changed[0]]}  ${subject}`);
   const firstLine = message.trim().split("\n")[0].trim();
   if (subject !== firstLine) out(`(message normalized from: ${firstLine})`);
   if (complete) {
+    const heads = Object.fromEntries(repos.names.map((name) => [name, headSha(repos.paths[name])]));
     meta.status = "complete";
     meta.closed = now();
     tasks.writeMeta(task, meta);
-    tasks.event(task, "complete", { head: sha });
-    out("GOAL COMPLETE. The task is closed.", `Task diff: git -C ${root} diff ${meta.base_commit}..HEAD`);
+    tasks.event(task, "complete", { heads });
+    out("GOAL COMPLETE. The task is closed.",
+      ...repos.names.map((name) => `Task diff: git -C ${repos.paths[name]} diff ${meta.base![name]}..HEAD`));
   } else {
     out(`NEXT: ${state.next}`);
   }
@@ -406,10 +452,12 @@ async function cmdHook() {
   const root = gitRoot();
   const matches = tasks.find(root, ["active"]);
   if (!matches.length) return EXIT_PASS;
-  const state = matches.length === 1 ? tasks.readState(matches[0]) : ({} as State);
+  const meta = matches.length === 1 ? tasks.readMeta(matches[0]) : null;
+  const name = Object.entries(meta?.repos ?? {}).find(([, p]) => p === root)?.[0];
+  const passed = meta && name ? tasks.readState(matches[0]).last_pass?.[name] : undefined;
   const [rc, staged] = git(root, ["write-tree"]);
   const tree = staged.trim();
-  if (rc === 0 && tree && tree === state.last_pass && tree === process.env[COMMIT_ENV]) return EXIT_PASS;
+  if (rc === 0 && tree && tree === passed && tree === process.env[COMMIT_ENV]) return EXIT_PASS;
   out("task-contract: commit rejected. It did not pass the gate.",
     `Active task: ${matches.map((m) => path.basename(m)).join(", ")}`,
     "Run check.ts, then check.ts --commit. To stop the task: check.ts --close.");
